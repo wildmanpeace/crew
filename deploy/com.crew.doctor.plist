@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  crew's external supervisor.
+
+  crew watch writes a heartbeat every poll, but a heartbeat only means
+  something if something outside the loop reads it. This job is that reader.
+  It must be external: the first mate may not run for hours, and crew watch
+  cannot report its own death.
+
+  This file is written but NOT loaded. To install it:
+
+      cp deploy/com.crew.doctor.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.crew.doctor.plist
+
+  To remove it:
+
+      launchctl bootout gui/$(id -u)/com.crew.doctor
+
+  Adjust WorkingDirectory to the project crew is driving, and the crew path if
+  you installed it elsewhere.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.crew.doctor</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/alexanderwild/.local/bin/crew</string>
+    <string>doctor</string>
+    <string>--notify</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/alexanderwild/Programming/OrchestrationFramework/sandbox</string>
+
+  <!-- Every five minutes. crew watch polls every 15s, so a stale heartbeat is
+       already obvious well before this fires. -->
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/crew-doctor.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/crew-doctor.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/alexanderwild/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>

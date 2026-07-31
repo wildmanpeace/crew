@@ -1,0 +1,388 @@
+package watch
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/wildmanpeace/crew/internal/budget"
+	"github.com/wildmanpeace/crew/internal/config"
+	"github.com/wildmanpeace/crew/internal/gitx"
+	"github.com/wildmanpeace/crew/internal/state"
+	"github.com/wildmanpeace/crew/internal/tmux"
+	"github.com/wildmanpeace/crew/internal/worker"
+)
+
+// ErrAlreadyRunning means another crew watch holds the singleton lock.
+var ErrAlreadyRunning = errors.New("another crew watch is already running")
+
+// Loop is the always-on driver. It is never self-daemonizing; something
+// external keeps it alive.
+type Loop struct {
+	Root      string
+	Cfg       *config.Config
+	Store     *state.Store
+	Repo      gitx.Repo
+	CrewBin   string
+	ClaudeBin string
+	Session   string
+	Loc       *time.Location
+
+	// Now is injectable so budget rollover and heartbeat behaviour are
+	// testable without waiting for real time to pass.
+	Now func() time.Time
+
+	// Notify delivers captain-facing events. Internal transitions such as
+	// verify_failed are recorded but never notified.
+	Notify func(state.Event)
+}
+
+func (l *Loop) now() time.Time {
+	if l.Now != nil {
+		return l.Now()
+	}
+	return time.Now().UTC()
+}
+
+func (l *Loop) runsDir() string { return filepath.Join(l.Root, ".crew", "runs") }
+
+func (l *Loop) emit(ev state.Event) {
+	if ev.At.IsZero() {
+		ev.At = l.now()
+	}
+	l.Store.Append(ev)
+	if l.Notify != nil {
+		l.Notify(ev)
+	}
+}
+
+// record writes an event without notifying, for internal transitions.
+func (l *Loop) record(ev state.Event) {
+	if ev.At.IsZero() {
+		ev.At = l.now()
+	}
+	l.Store.Append(ev)
+}
+
+// Lock acquires the singleton lock, held for the process lifetime.
+//
+// It is non-blocking on purpose: a second watch should fail loudly rather
+// than wait and then silently start driving the same tasks.
+func Lock(root string) (release func() error, err error) {
+	path := filepath.Join(root, ".crew", "watch.lock")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create .crew: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open watch lock: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, ErrAlreadyRunning
+	}
+	f.Truncate(0)
+	fmt.Fprintf(f, "%d\n", os.Getpid())
+	return func() error {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+		return os.Remove(path)
+	}, nil
+}
+
+// Run holds the singleton lock, repairs any interrupted state, and polls
+// until the context is cancelled.
+func (l *Loop) Run(ctx context.Context) error {
+	release, err := Lock(l.Root)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if err := l.Repair(); err != nil {
+		return fmt.Errorf("startup repair: %w", err)
+	}
+
+	interval := time.Duration(l.Cfg.PollIntervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		if err := l.Tick(ctx); err != nil {
+			l.record(state.Event{Kind: "watch_error", Detail: err.Error()})
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+// Repair reconciles intents recorded before an effect that may never have
+// happened.
+//
+// Every side effect is preceded by a durable record naming the identifiers
+// the effect will use, so a crash between the two is detectable: if neither
+// the window nor the run's exit marker exists, the effect never took place
+// and the task is returned to its prior status rather than being left
+// stranded in spawning.
+func (l *Loop) Repair() error {
+	st, err := l.Store.Read()
+	if err != nil {
+		return err
+	}
+	for _, ts := range st.PendingIntents() {
+		intent := ts.PendingIntent
+		if intent.Action != state.IntentSpawnWindow {
+			continue
+		}
+		windowLive, _ := tmux.WindowExists(l.Session, intent.Window)
+		_, runDone, _ := worker.ReadExit(l.runsDir(), intent.RunID)
+
+		switch {
+		case runDone:
+			// The effect completed; the normal completion path will pick it up.
+			l.clearIntent(ts.ID, "")
+		case windowLive:
+			// The effect happened and is still going.
+			l.clearIntent(ts.ID, state.StatusRunning)
+		default:
+			// The effect never happened.
+			l.clearIntent(ts.ID, state.StatusQueued)
+			l.record(state.Event{TaskID: ts.ID, Kind: "repaired",
+				Detail: fmt.Sprintf("spawn intent for run %s never took effect; returned to queued", intent.RunID)})
+		}
+	}
+	return nil
+}
+
+func (l *Loop) clearIntent(taskID string, newStatus state.Status) {
+	l.Store.Update(func(st *state.State) error {
+		ts := st.Tasks[taskID]
+		if ts == nil {
+			return nil
+		}
+		ts.PendingIntent = nil
+		if newStatus != "" {
+			ts.Status = newStatus
+		}
+		ts.UpdatedAt = l.now()
+		return nil
+	})
+}
+
+// Tick performs one pass: heartbeat, then advance every task that has
+// something to advance.
+func (l *Loop) Tick(ctx context.Context) error {
+	if _, err := l.Store.Update(func(st *state.State) error {
+		st.WatchHeartbeat = l.now()
+		st.WatchPID = os.Getpid()
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	st, err := l.Store.Read()
+	if err != nil {
+		return err
+	}
+
+	// Advance anything that has finished.
+	for id, ts := range st.Tasks {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		if ts.RunID == "" || !isActive(ts.Status) {
+			continue
+		}
+		code, done, err := worker.ReadExit(l.runsDir(), ts.RunID)
+		if err != nil || !done {
+			continue
+		}
+		if err := l.onWorkerExit(id, code); err != nil {
+			l.record(state.Event{TaskID: id, Kind: "watch_error", Detail: err.Error()})
+		}
+	}
+
+	// Start the first implementer for anything queued. crew spawn prepares the
+	// branch and worktree and stops; every worker is started here, so there is
+	// exactly one place that spawns.
+	return l.startQueued(ctx)
+}
+
+// startQueued spawns the first implementer of each queued task, subject to the
+// concurrency cap. Budget is checked inside SpawnWorker, before the spawn.
+func (l *Loop) startQueued(ctx context.Context) error {
+	st, err := l.Store.Read()
+	if err != nil {
+		return err
+	}
+	var queued []string
+	for id, ts := range st.Tasks {
+		if ts.Status == state.StatusQueued {
+			queued = append(queued, id)
+		}
+	}
+	sort.Strings(queued)
+
+	for _, id := range queued {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		ok, err := l.SlotAvailable(id)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		t, err := l.Task(id)
+		if err != nil {
+			l.blockTask(id, err.Error())
+			continue
+		}
+		if err := l.SpawnWorker(id, config.RoleImplementer, 1, ImplementerBrief(t, 1, nil)); err != nil {
+			l.record(state.Event{TaskID: id, Kind: "watch_error", Detail: err.Error()})
+		}
+	}
+	return nil
+}
+
+func isActive(s state.Status) bool {
+	return s == state.StatusSpawning || s == state.StatusRunning || s == state.StatusVerifying
+}
+
+// onWorkerExit is the completion path. It is invoked only after the process
+// has exited, so the report file cannot be read mid-write.
+//
+// Cost is recorded before any decision, so a task cannot spend past its cap
+// by way of a decision taken on stale spend.
+func (l *Loop) onWorkerExit(taskID string, exitCode int) error {
+	return l.Complete(taskID)
+}
+
+// recordSpend adds a finished run's cost to both the task total and the
+// project's daily ledger.
+func (l *Loop) recordSpend(ts *state.TaskState) error {
+	raw, err := os.ReadFile(worker.RawOutputPath(l.runsDir(), ts.RunID))
+	if err != nil {
+		return nil // no output to account for
+	}
+	env, err := worker.ParseEnvelope(raw)
+	if err != nil || env.TotalCostUSD == 0 {
+		return nil
+	}
+	_, err = l.Store.Update(func(st *state.State) error {
+		t := st.Tasks[ts.ID]
+		if t == nil {
+			return nil
+		}
+		t.SpendUSD += env.TotalCostUSD
+		st.AddSpend(l.now(), l.Loc, env.TotalCostUSD)
+		return nil
+	})
+	return err
+}
+
+// Caps builds the budget ceilings from config.
+func (l *Loop) Caps() budget.Caps {
+	return budget.Caps{
+		PerWorker:    l.Cfg.PerWorkerBudgetUSD,
+		PerTask:      l.Cfg.PerTaskCostCapUSD,
+		PerDay:       l.Cfg.ProjectCostCapUSDPerDay,
+		SafetyMargin: l.Cfg.BudgetSafetyMargin,
+		MinSpawn:     l.Cfg.MinSpawnBudgetUSD,
+	}
+}
+
+// BudgetFor returns the budget for a task's next worker, refusing before the
+// spawn rather than discovering a breach after one.
+func (l *Loop) BudgetFor(taskID string) (float64, error) {
+	st, err := l.Store.Read()
+	if err != nil {
+		return 0, err
+	}
+	var taskSpent float64
+	if ts := st.Tasks[taskID]; ts != nil {
+		taskSpent = ts.SpendUSD
+	}
+	return budget.ForNextWorker(l.Caps(), taskSpent, st.DailySpend(l.now(), l.Loc))
+}
+
+// SlotAvailable reports whether the concurrency cap permits another task to
+// start. Slots are counted in tasks, not workers: an implementer handing over
+// to a verifier inside the same task never contends for a second slot.
+func (l *Loop) SlotAvailable(excludingTask string) (bool, error) {
+	st, err := l.Store.Read()
+	if err != nil {
+		return false, err
+	}
+	inFlight := 0
+	for id, ts := range st.Tasks {
+		if id == excludingTask {
+			continue
+		}
+		if ts.Status.InFlight() {
+			inFlight++
+		}
+	}
+	return inFlight < l.Cfg.ConcurrencyCap, nil
+}
+
+// CleanVerifyTests removes verifier-authored tests from a worktree.
+//
+// They are deleted between cycles so the next implementer neither sees them
+// nor can adapt its implementation to them, and so they never reach a diff a
+// worker reads.
+func CleanVerifyTests(worktree, suffix string) ([]string, error) {
+	if suffix == "" {
+		return nil, nil
+	}
+	var removed []string
+	err := filepath.WalkDir(worktree, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), suffix) {
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("remove %s: %w", path, err)
+			}
+			rel, _ := filepath.Rel(worktree, path)
+			removed = append(removed, rel)
+		}
+		return nil
+	})
+	return removed, err
+}
+
+// BranchName is the branch for a task attempt. Branches are namespaced by
+// attempt from the start, so a reframe never collides with the attempt it is
+// abandoning and the failed attempt stays readable.
+func BranchName(taskID string, attempt int) string {
+	return fmt.Sprintf("crew/%s/attempt-%d", taskID, attempt)
+}
+
+// WorktreePath is the worktree for a task attempt, namespaced to match.
+func WorktreePath(root, taskID string, attempt int) string {
+	return filepath.Join(root, ".crew", "worktrees", taskID, fmt.Sprintf("attempt-%d", attempt))
+}

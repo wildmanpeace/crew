@@ -59,10 +59,9 @@ func main() {
 func dispatch(app *cli.App, cmd string, args []string) error {
 	switch cmd {
 	case "spawn":
-		fs := flag.NewFlagSet("spawn", flag.ExitOnError)
+		fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
 		force := fs.Bool("force", false, "override refused preconditions")
-		fs.Parse(args)
-		id, err := requireTask(fs)
+		id, err := taskArg(fs, args, "crew spawn <task-id> [--force]")
 		if err != nil {
 			return err
 		}
@@ -76,10 +75,9 @@ func dispatch(app *cli.App, cmd string, args []string) error {
 		return app.Review(id)
 
 	case "approve":
-		fs := flag.NewFlagSet("approve", flag.ExitOnError)
+		fs := flag.NewFlagSet("approve", flag.ContinueOnError)
 		head := fs.String("head", "", "the branch head sha being approved")
-		fs.Parse(args)
-		id, err := requireTask(fs)
+		id, err := taskArg(fs, args, "crew approve <task-id> --head <sha>")
 		if err != nil {
 			return err
 		}
@@ -107,36 +105,38 @@ func dispatch(app *cli.App, cmd string, args []string) error {
 		return app.Rebase(id)
 
 	case "status":
-		fs := flag.NewFlagSet("status", flag.ExitOnError)
+		fs := flag.NewFlagSet("status", flag.ContinueOnError)
 		asJSON := fs.Bool("json", false, "machine-readable output")
 		asMD := fs.Bool("markdown", false, "markdown table output")
-		fs.Parse(args)
+		if _, err := cli.ParseArgs(fs, args); err != nil {
+			return err
+		}
 		return app.PrintStatus(*asJSON, *asMD)
 
 	case "peek":
-		fs := flag.NewFlagSet("peek", flag.ExitOnError)
+		fs := flag.NewFlagSet("peek", flag.ContinueOnError)
 		lines := fs.Int("lines", 200, "how many lines of the pane to show")
-		fs.Parse(args)
-		id, err := requireTask(fs)
+		id, err := taskArg(fs, args, "crew peek <task-id> [--lines N]")
 		if err != nil {
 			return err
 		}
 		return app.Peek(id, *lines)
 
 	case "teardown":
-		fs := flag.NewFlagSet("teardown", flag.ExitOnError)
+		fs := flag.NewFlagSet("teardown", flag.ContinueOnError)
 		rm := fs.Bool("remove-worktree", false, "also remove the worktree")
-		fs.Parse(args)
-		id, err := requireTask(fs)
+		id, err := taskArg(fs, args, "crew teardown <task-id> [--remove-worktree]")
 		if err != nil {
 			return err
 		}
 		return app.Teardown(id, *rm)
 
 	case "doctor":
-		fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+		fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 		notify := fs.Bool("notify", false, "emit a notification when problems are found")
-		fs.Parse(args)
+		if _, err := cli.ParseArgs(fs, args); err != nil {
+			return err
+		}
 		err := app.Doctor()
 		if err != nil && *notify {
 			cli.Notify("crew doctor", err.Error())
@@ -147,10 +147,9 @@ func dispatch(app *cli.App, cmd string, args []string) error {
 		return app.GC()
 
 	case "verify":
-		fs := flag.NewFlagSet("verify", flag.ExitOnError)
+		fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 		force := fs.Bool("force", false, "required: this is a debug-only command")
-		fs.Parse(args)
-		id, err := requireTask(fs)
+		id, err := taskArg(fs, args, "crew verify <task-id> --force")
 		if err != nil {
 			return err
 		}
@@ -181,11 +180,24 @@ func requireArg(args []string, use string) (string, error) {
 	return args[0], nil
 }
 
-func requireTask(fs *flag.FlagSet) (string, error) {
-	if fs.NArg() < 1 {
-		return "", fmt.Errorf("a task id is required")
+// taskArg parses a command's flags and returns its task id.
+//
+// Flags are permuted ahead of positionals first, so "crew teardown my-task
+// --remove-worktree" behaves the same as the flag-first ordering. Go's flag
+// package stops at the first positional, which made every flag written after
+// a task id silently ineffective.
+func taskArg(fs *flag.FlagSet, args []string, use string) (string, error) {
+	pos, err := cli.ParseArgs(fs, args)
+	if err != nil {
+		return "", fmt.Errorf("%w\nusage: %s", err, use)
 	}
-	return fs.Arg(0), nil
+	if len(pos) == 0 {
+		return "", fmt.Errorf("a task id is required\nusage: %s", use)
+	}
+	if len(pos) > 1 {
+		return "", fmt.Errorf("unexpected arguments %q\nusage: %s", pos[1:], use)
+	}
+	return pos[0], nil
 }
 
 // findRoot walks up from the working directory looking for .crew/config.json,

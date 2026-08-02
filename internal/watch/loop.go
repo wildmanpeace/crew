@@ -197,21 +197,33 @@ func (l *Loop) Tick(ctx context.Context) error {
 		return err
 	}
 
-	// Advance anything that has finished.
+	// Advance anything that has finished, and reconcile anything that has not.
+	var active []string
 	for id, ts := range st.Tasks {
+		if ts.RunID != "" && isActive(ts.Status) {
+			active = append(active, id)
+		}
+	}
+	sort.Strings(active)
+
+	for _, id := range active {
 		select {
 		case <-ctx.Done():
 			return nil
 		default:
 		}
-		if ts.RunID == "" || !isActive(ts.Status) {
-			continue
-		}
+		ts := st.Tasks[id]
 		code, done, err := worker.ReadExit(l.runsDir(), ts.RunID)
-		if err != nil || !done {
+		if err != nil {
 			continue
 		}
-		if err := l.onWorkerExit(id, code); err != nil {
+		if done {
+			if err := l.onWorkerExit(id, code); err != nil {
+				l.record(state.Event{TaskID: id, Kind: "watch_error", Detail: err.Error()})
+			}
+			continue
+		}
+		if err := l.reconcileActive(id, ts); err != nil {
 			l.record(state.Event{TaskID: id, Kind: "watch_error", Detail: err.Error()})
 		}
 	}
@@ -264,6 +276,75 @@ func (l *Loop) startQueued(ctx context.Context) error {
 
 func isActive(s state.Status) bool {
 	return s == state.StatusSpawning || s == state.StatusRunning || s == state.StatusVerifying
+}
+
+// spawnGrace is how long after a spawn crew waits before believing a missing
+// window. It absorbs the moment between recording the spawn and tmux reporting
+// the window, so a healthy worker is never declared dead on its first tick.
+const spawnGrace = 20 * time.Second
+
+// reconcileActive handles a worker that has not reported completion.
+//
+// Without this, a worker whose window dies mid-run leaves its task in running
+// forever: the loop only advances a task when the exit marker appears, so a
+// process that is killed before writing one is never noticed. The task holds a
+// concurrency slot indefinitely and fails crew doctor, which in turn refuses
+// every subsequent spawn.
+func (l *Loop) reconcileActive(id string, ts *state.TaskState) error {
+	// A worker that has only just been spawned gets the benefit of the doubt.
+	if !ts.RunStartedAt.IsZero() && l.now().Sub(ts.RunStartedAt) < spawnGrace {
+		return nil
+	}
+
+	alive, err := tmux.WindowExists(l.Session, ts.Window)
+	if err != nil {
+		// tmux could not answer, so nothing is known. Leaving the task alone is
+		// the safe reading: declaring it dead on an unreadable answer would
+		// kill healthy work.
+		return nil
+	}
+
+	if !alive {
+		// Re-read the exit marker before concluding anything. A worker that
+		// finished a moment ago has already closed its window, and calling that
+		// orphaned would fail a run that actually succeeded.
+		if code, done, err := worker.ReadExit(l.runsDir(), ts.RunID); err == nil && done {
+			return l.onWorkerExit(id, code)
+		}
+		reason := fmt.Sprintf(
+			"worker %s stopped without reporting: its window is gone and no exit marker was written",
+			ts.RunID)
+		l.failRun(id, ts, reason, "worker_vanished")
+		return nil
+	}
+
+	// The window is alive, so the only remaining question is whether it has
+	// outlived its wall clock.
+	timeout := time.Duration(l.Cfg.WallClockTimeoutSeconds) * time.Second
+	if timeout <= 0 || ts.RunStartedAt.IsZero() {
+		return nil
+	}
+	if ran := l.now().Sub(ts.RunStartedAt); ran > timeout {
+		if err := tmux.KillWindow(l.Session, ts.Window); err != nil {
+			l.record(state.Event{TaskID: id, Kind: "watch_error",
+				Detail: "kill timed-out window: " + err.Error()})
+		}
+		reason := fmt.Sprintf(
+			"worker %s exceeded wall_clock_timeout_seconds (%s of %s) and was stopped",
+			ts.RunID, ran.Round(time.Second), timeout)
+		l.failRun(id, ts, reason, "worker_timeout")
+	}
+	return nil
+}
+
+// failRun ends a task whose worker never reported.
+//
+// Any spend the worker did incur is recorded first, so a run that burned money
+// before dying still counts against the caps.
+func (l *Loop) failRun(id string, ts *state.TaskState, reason, kind string) {
+	l.recordSpend(ts)
+	l.setStatus(id, state.StatusFailed, reason)
+	l.emit(state.Event{TaskID: id, Kind: kind, Detail: reason})
 }
 
 // onWorkerExit is the completion path. It is invoked only after the process

@@ -102,6 +102,11 @@ type TaskState struct {
 	Role     string `json:"role,omitempty"`
 	RunID    string `json:"run_id,omitempty"`
 
+	// RunStartedAt is when the active worker was spawned. It is what makes a
+	// wall-clock timeout enforceable: without it, a worker that hangs is
+	// indistinguishable from one that is simply taking a while.
+	RunStartedAt time.Time `json:"run_started_at,omitempty"`
+
 	SpendUSD    float64 `json:"spend_usd"`
 	HeadSha     string  `json:"head_sha,omitempty"`
 	ApprovedSha string  `json:"approved_sha,omitempty"`

@@ -27,14 +27,18 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type step struct {
-	CostUSD  float64         `json:"cost_usd"`
-	Exit     int             `json:"exit"`
-	Report   json.RawMessage `json:"report,omitempty"`
-	NoReport bool            `json:"no_report,omitempty"`
-	Subtype  string          `json:"subtype,omitempty"`
+	// SleepSeconds holds the process open, so a hung or killed worker can be
+	// reproduced without waiting on a real model.
+	SleepSeconds float64         `json:"sleep_seconds,omitempty"`
+	CostUSD      float64         `json:"cost_usd"`
+	Exit         int             `json:"exit"`
+	Report       json.RawMessage `json:"report,omitempty"`
+	NoReport     bool            `json:"no_report,omitempty"`
+	Subtype      string          `json:"subtype,omitempty"`
 }
 
 func main() {
@@ -62,6 +66,10 @@ func main() {
 	s := steps[idx]
 
 	fmt.Fprintf(os.Stderr, "fakeclaude: step %d for %s\n", idx, worktree)
+
+	if s.SleepSeconds > 0 {
+		time.Sleep(time.Duration(s.SleepSeconds * float64(time.Second)))
+	}
 
 	if !s.NoReport && len(s.Report) > 0 {
 		if err := os.WriteFile(filepath.Join(worktree, ".crew-report.json"), s.Report, 0o644); err != nil {

@@ -478,3 +478,102 @@ func TestBudgetExhaustionIsBlockedNotFailed(t *testing.T) {
 		t.Errorf("Notes = %q, want it to name the budget", ts.Notes)
 	}
 }
+
+// A worker whose window dies mid-run without writing an exit marker must be
+// noticed. Before this, the task sat in running forever, held a concurrency
+// slot, and failed crew doctor, which refused every later spawn.
+func TestVanishedWorkerIsFailedNotLeftRunning(t *testing.T) {
+	h := newHarness(t, []map[string]any{
+		{"cost_usd": 0.05, "exit": 0, "sleep_seconds": 120, "no_report": true},
+	})
+	h.loop.Cfg.WallClockTimeoutSeconds = 0 // isolate the vanished-window path
+	h.start("alpha")
+
+	// Let the worker get past the spawn grace, then kill its window as an
+	// abrupt death would.
+	st, _ := h.loop.Store.Read()
+	window := st.Tasks["alpha"].Window
+	if window == "" {
+		t.Fatal("no window recorded")
+	}
+	h.rewindRunStart("alpha", 2*time.Minute)
+	if err := tmux.KillWindow(h.session, window); err != nil {
+		t.Fatalf("KillWindow: %v", err)
+	}
+
+	ts := h.settle("alpha", state.StatusFailed)
+	if !strings.Contains(ts.Notes, "without reporting") {
+		t.Errorf("Notes = %q, want it to name the vanished worker", ts.Notes)
+	}
+	// The slot must be released.
+	if ts.Status.InFlight() {
+		t.Error("a dead task is still holding a concurrency slot")
+	}
+}
+
+// wall_clock_timeout_seconds was configured but never read, so a hung worker
+// ran forever.
+func TestHungWorkerIsStoppedAtTheWallClock(t *testing.T) {
+	h := newHarness(t, []map[string]any{
+		{"cost_usd": 0.05, "exit": 0, "sleep_seconds": 120, "no_report": true},
+	})
+	h.loop.Cfg.WallClockTimeoutSeconds = 1
+	h.start("alpha")
+
+	st, _ := h.loop.Store.Read()
+	window := st.Tasks["alpha"].Window
+	h.rewindRunStart("alpha", 2*time.Minute)
+
+	ts := h.settle("alpha", state.StatusFailed)
+	if !strings.Contains(ts.Notes, "wall_clock_timeout_seconds") {
+		t.Errorf("Notes = %q, want it to name the timeout", ts.Notes)
+	}
+	// The worker must actually be stopped, not merely marked failed.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if alive, _ := tmux.WindowExists(h.session, window); !alive {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("the timed-out worker's window is still running")
+}
+
+// A worker that finishes normally must never be mistaken for a dead one, even
+// though its window closes the moment it exits.
+func TestFinishedWorkerIsNotMistakenForVanished(t *testing.T) {
+	h := newHarness(t, []map[string]any{
+		step(0.10, implReport("done")),
+		step(0.05, verifierReport("satisfied", true)),
+	})
+	// No timeout: the question here is only whether a closed window is
+	// mistaken for a dead worker.
+	h.loop.Cfg.WallClockTimeoutSeconds = 0
+	h.start("alpha")
+	// Backdate past the spawn grace so the vanished-window check is live on
+	// every tick while the workers are exiting. Each worker's window closes the
+	// instant it finishes, so the exit marker must win the race.
+	h.rewindRunStart("alpha", 2*time.Minute)
+
+	ts := h.settle("alpha", state.StatusReadyForReview, state.StatusFailed)
+	if ts.Status != state.StatusReadyForReview {
+		t.Fatalf("Status = %q, want ready_for_review; a completed run was misread as dead: %s",
+			ts.Status, ts.Notes)
+	}
+}
+
+// rewindRunStart backdates a run's start so timeout and grace behaviour can be
+// exercised without waiting in real time.
+func (h *harness) rewindRunStart(taskID string, by time.Duration) {
+	h.t.Helper()
+	if _, err := h.loop.Store.Update(func(st *state.State) error {
+		ts := st.Tasks[taskID]
+		if ts == nil {
+			return nil
+		}
+		ts.RunStartedAt = ts.RunStartedAt.Add(-by)
+		return nil
+	}); err != nil {
+		h.t.Fatal(err)
+	}
+}

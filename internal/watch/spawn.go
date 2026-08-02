@@ -76,6 +76,7 @@ func (l *Loop) SpawnWorker(taskID string, role config.Role, cycle int, brief str
 		t.Role = string(role)
 		t.Cycle = cycle
 		t.RunID = runID
+		t.RunStartedAt = l.now()
 		t.Window = tmuxWindow(runID)
 		t.PendingIntent = &state.Intent{
 			Action: state.IntentSpawnWindow,

@@ -432,9 +432,13 @@ func (l *Loop) controlFor(taskID, branch string, c *report.CriterionResult,
 		ApplyNegativeControl(c, res)
 	}
 
-	// A criterion that fell back to judgment is tracked so a repeatedly
-	// undecidable one can be surfaced for re-tagging.
-	if c.Evaluation == report.EvalJudged {
+	// Any control that produced no evidence is counted, not only one that fell
+	// back to judgment. A criterion whose test keeps passing at merge-base
+	// stays mechanical on purpose, but repeating that outcome is the strongest
+	// signal there is that the criterion cannot be verified mechanically at
+	// all: a criterion asserting behaviour is *unchanged* passes at merge-base
+	// by construction, and no implementation can ever satisfy it.
+	if res.Downgrades() {
 		l.Store.Update(func(st *state.State) error {
 			st.Tasks[taskID].NoteDegraded(description)
 			return nil

@@ -301,6 +301,6 @@ func RetagSuggestion(ts *state.TaskState, criterion string) string {
 		return ""
 	}
 	return fmt.Sprintf(
-		"criterion %q has degraded to judgment %d times; consider re-tagging it as `judged: true` in TASKS.md",
+		"criterion %q has failed to produce mechanical evidence %d times; consider re-tagging it as `judged: true` in TASKS.md",
 		criterion, ts.DegradedCount(criterion))
 }

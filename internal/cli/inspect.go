@@ -183,7 +183,7 @@ func (a *App) Status() (StatusReport, error) {
 		for crit := range ts.DegradedCounts {
 			if ts.ShouldSuggestRetag(crit) {
 				suggestions = append(suggestions, fmt.Sprintf(
-					"criterion %q degraded to judgment %d times; consider re-tagging it `judged: true` in TASKS.md",
+					"criterion %q failed to produce mechanical evidence %d times; consider re-tagging it `judged: true` in TASKS.md",
 					crit, ts.DegradedCount(crit)))
 			}
 		}

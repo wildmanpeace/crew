@@ -323,3 +323,56 @@ func TestSelfAuthoredTestAppendedToAnExistingFileIsStillControlled(t *testing.T)
 		t.Fatal("a vacuous test in a modified file still counted as evidence")
 	}
 }
+
+// A criterion asserting that behaviour is *unchanged* passes at merge-base by
+// construction, so no implementation can ever make it discriminate. crew must
+// notice that and suggest re-tagging, rather than letting the task burn every
+// cycle chasing it.
+//
+// This is what happened in the sandbox: the same criterion came back
+// passes_at_merge_base on all three cycles, no suggestion was ever surfaced,
+// and the task blocked having spent $4.74.
+func TestRepeatedlyUnverifiableCriterionSuggestsARetag(t *testing.T) {
+	l := selfAuthoredFixture(t, vacuousTest)
+
+	for cycle := 1; cycle <= 2; cycle++ {
+		r := verifierClaim()
+		if err := l.runNegativeControls("alpha", r); err != nil {
+			t.Fatalf("cycle %d: %v", cycle, err)
+		}
+		if r.CriteriaResults[0].Classification != "passes_at_merge_base" {
+			t.Fatalf("cycle %d: classification = %q", cycle, r.CriteriaResults[0].Classification)
+		}
+	}
+
+	st, _ := l.Store.Read()
+	ts := st.Tasks["alpha"]
+	const crit = "Allow returns false once the bucket is exhausted."
+
+	if got := ts.DegradedCount(crit); got != 2 {
+		t.Fatalf("DegradedCount = %d, want 2; a non-discriminating control was not counted", got)
+	}
+	got := RetagSuggestion(ts, crit)
+	if got == "" {
+		t.Fatal("no re-tag suggestion after two controls that produced no evidence")
+	}
+	if !strings.Contains(got, "judged: true") || !strings.Contains(got, "TASKS.md") {
+		t.Errorf("suggestion = %q", got)
+	}
+}
+
+// A criterion that discriminates must never accumulate a re-tag suggestion.
+func TestDiscriminatingCriterionNeverSuggestsARetag(t *testing.T) {
+	l := selfAuthoredFixture(t, realTest)
+	for cycle := 1; cycle <= 2; cycle++ {
+		r := verifierClaim()
+		if err := l.runNegativeControls("alpha", r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, _ := l.Store.Read()
+	ts := st.Tasks["alpha"]
+	if got := ts.DegradedCount("Allow returns false once the bucket is exhausted."); got != 0 {
+		t.Fatalf("DegradedCount = %d, want 0 for a criterion that produces evidence", got)
+	}
+}

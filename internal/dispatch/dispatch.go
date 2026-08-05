@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/wildmanpeace/crew/internal/config"
+	"github.com/wildmanpeace/crew/internal/report"
 )
 
 // Exit codes. Policy refusals are distinguished from a check command's own
@@ -143,7 +144,22 @@ func runCommit(worktree string, rest []string, run RunFunc) (int, error) {
 	if strings.TrimSpace(msg) == "" {
 		return ExitPolicy, fmt.Errorf("commit message must not be empty")
 	}
-	if code, err := run([]string{"git", "add", "-A"}, worktree); err != nil || code != 0 {
+	// A worker probing the CLI must not leave a commit behind. Without this,
+	// "crew-run commit --help" committed the tree under the message "--help".
+	if msg == "-h" || msg == "--help" {
+		return ExitPolicy, fmt.Errorf(`usage: crew-run commit "<message>"`)
+	}
+	if strings.HasPrefix(msg, "-") {
+		return ExitPolicy, fmt.Errorf("commit message must not begin with %q; it looks like a flag, not a message", "-")
+	}
+	// Stage everything except crew's own artifacts. The report lives in the
+	// worktree root and git add -A would sweep it into the commit, so crew
+	// would land its own mechanical files in the project's history. Excluding
+	// them here means that cannot happen regardless of what the project
+	// gitignores.
+	add := []string{"git", "add", "-A", "--",
+		".", ":(exclude)" + report.Filename, ":(exclude).crew"}
+	if code, err := run(add, worktree); err != nil || code != 0 {
 		if err != nil {
 			return code, fmt.Errorf("git add: %w", err)
 		}

@@ -273,3 +273,45 @@ func TestIntegrationRoleCannotBeOverriddenByEnvironment(t *testing.T) {
 		t.Fatalf("unexpected failure: %s", out)
 	}
 }
+
+// crew must not commit its own artifacts into the project's history. The
+// report sits in the worktree root, and a plain "git add -A" swept it into
+// every commit a worker made; it reached the sandbox's main branch that way.
+func TestIntegrationCommitExcludesCrewArtifacts(t *testing.T) {
+	root, wt := project(t)
+	write(t, filepath.Join(wt, "impl.go"), "package probe\n\nvar Z = 3\n")
+	write(t, filepath.Join(wt, ".crew-report.json"),
+		`{"task_id":"alpha","role":"implementer","status":"done"}`)
+
+	if got := dispatchRun(t, "crew-run", root, wt, "commit", "add Z"); got.code != 0 {
+		t.Fatalf("commit exit = %d\n%s", got.code, got.output)
+	}
+	files := git(t, wt, "show", "--name-only", "--format=", "HEAD")
+	if !strings.Contains(files, "impl.go") {
+		t.Errorf("the implementation was not committed:\n%s", files)
+	}
+	if strings.Contains(files, ".crew-report.json") {
+		t.Fatalf("crew committed its own report into the project:\n%s", files)
+	}
+	// And it must still be on disk for crew to read after the worker exits.
+	if _, err := os.Stat(filepath.Join(wt, ".crew-report.json")); err != nil {
+		t.Errorf("the report was removed from the worktree: %v", err)
+	}
+}
+
+// A worker probing the CLI must not leave a commit behind.
+func TestIntegrationCommitRejectsFlagLikeMessages(t *testing.T) {
+	root, wt := project(t)
+	write(t, filepath.Join(wt, "impl.go"), "package probe\n\nvar Z = 3\n")
+	before := strings.TrimSpace(git(t, wt, "rev-parse", "HEAD"))
+
+	for _, msg := range []string{"--help", "-h", "--amend"} {
+		got := dispatchRun(t, "crew-run", root, wt, "commit", msg)
+		if got.code != 2 {
+			t.Errorf("commit %q exit = %d, want 2\n%s", msg, got.code, got.output)
+		}
+	}
+	if after := strings.TrimSpace(git(t, wt, "rev-parse", "HEAD")); after != before {
+		t.Fatal("a flag-like message created a commit")
+	}
+}

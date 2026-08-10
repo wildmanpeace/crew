@@ -16,8 +16,10 @@
 
       launchctl bootout gui/$(id -u)/com.crew.doctor
 
-  Adjust WorkingDirectory to the project crew is driving, and the crew path if
-  you installed it elsewhere.
+  The paths below are placeholders. Before installing, replace every
+  /Users/YOU with your home directory: WorkingDirectory must point at the
+  project crew is driving, and ProgramArguments at wherever you installed
+  crew. launchd expands neither ~ nor $HOME, so all of them must be absolute.
 -->
 <plist version="1.0">
 <dict>
@@ -26,13 +28,13 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/alexanderwild/.local/bin/crew</string>
+    <string>/Users/YOU/.local/bin/crew</string>
     <string>doctor</string>
     <string>--notify</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/alexanderwild/Programming/OrchestrationFramework/sandbox</string>
+  <string>/Users/YOU/path/to/your-project</string>
 
   <!-- Every five minutes. crew watch polls every 15s, so a stale heartbeat is
        already obvious well before this fires. -->
@@ -50,7 +52,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/Users/alexanderwild/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
 </dict>
 </plist>

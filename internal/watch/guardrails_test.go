@@ -176,6 +176,13 @@ func TestGuardrailWorkerContextIsIsolated(t *testing.T) {
 	if !strings.Contains(body, "claudeMdExcludes") {
 		t.Error("the captain's global CLAUDE.md is not excluded from worker context")
 	}
+	// A worktree is a full checkout, so the project's own memory files sit
+	// inside it. Without this exclusion a worker loads whatever the project
+	// wrote for the captain's interactive session, which is not its job.
+	wtPattern := filepath.Join(h.root, ".crew", "worktrees", "**")
+	if !strings.Contains(body, wtPattern) {
+		t.Errorf("worktree memory files are not excluded; want %q in:\n%s", wtPattern, body)
+	}
 }
 
 // The red path: three cycles, a reframe, and a fresh attempt that does not

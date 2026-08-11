@@ -216,6 +216,13 @@ under three independent layers:
    at compile time; the role is never read from the environment, because a
    worker controls its own environment.
 
+A worker's *context* is confined the same way. Auto memory is off, so nothing
+accumulates between one-shot runs, and `claudeMdExcludes` covers both the
+captain's global `~/.claude/CLAUDE.md` and everything under `.crew/worktrees/`.
+That second one matters more than it looks: a worktree is a full checkout, so
+without it a worker would load whatever memory files the project wrote for the
+captain's interactive session. A worker's context is its brief and the code.
+
 Budgets are checked before a spawn, not discovered after. Each worker's budget
 is shrunk by a safety margin because `--max-budget-usd` is applied *after* the
 turn that breaches it — measured overshooting its cap by 3.5x — so a worker

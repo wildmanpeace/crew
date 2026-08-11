@@ -25,6 +25,33 @@ func Notify(title, body string) {
 	_ = exec.Command("osascript", "-e", script).Run()
 }
 
+// WorkerClaudeMdExcludes lists the memory files a worker must not load.
+//
+// Claude Code discovers CLAUDE.md by walking up from the working directory,
+// and a worker's working directory is its worktree — a full checkout of the
+// project, memory files and all. So a worker inherits, by default, every
+// instruction the project wrote for the captain's interactive session: the
+// first mate's role, the approval etiquette, the interview. None of it
+// describes the job a one-shot worker was spawned to do, and some of it
+// actively contradicts it.
+//
+// The whole worktree subtree is excluded rather than a specific filename,
+// because the point is not that CLAUDE.md in particular is unwelcome. It is
+// that a worker's context should be its brief and the code, and nothing a
+// checkout happens to carry should be able to add to that.
+//
+// A home directory that will not resolve costs the captain's own exclusion but
+// never the worktree one, which is the more important of the two.
+func WorkerClaudeMdExcludes(root, home string) []string {
+	var out []string
+	if home != "" {
+		// Keep the captain's personal conventions out of worker context: they
+		// describe how the captain works, not this project.
+		out = append(out, filepath.Join(home, ".claude", "CLAUDE.md"))
+	}
+	return append(out, filepath.Join(root, ".crew", "worktrees", "**"))
+}
+
 // WriteWorkerSettings writes the per-role settings each worker is launched
 // with.
 //
@@ -35,12 +62,9 @@ func (a *App) WriteWorkerSettings() error {
 	if err != nil {
 		return err
 	}
-	var excludes []string
-	if home, err := os.UserHomeDir(); err == nil {
-		// Keep the captain's personal conventions out of worker context: they
-		// describe how the captain works, not this project.
-		excludes = append(excludes, filepath.Join(home, ".claude", "CLAUDE.md"))
-	}
+	home, _ := os.UserHomeDir()
+	excludes := WorkerClaudeMdExcludes(a.Root, home)
+
 	for _, role := range []config.Role{config.RoleImplementer, config.RoleVerifier} {
 		body, err := worker.Settings(self, role, excludes)
 		if err != nil {

@@ -47,6 +47,25 @@ func NextImplementerCycle(ts *state.TaskState, cfg *config.Config) (cycle int, a
 	return next, next <= cfg.MaxCycles
 }
 
+// ResumeStep returns the role and cycle a queued task should be started at.
+//
+// Queued is not only where crew spawn leaves a task; it is also where a spawn
+// that failed transiently returns one, and by then the role and cycle that
+// spawn was attempting are already recorded. Always restarting at cycle 1's
+// implementer turned a failed verifier spawn into a fresh implementation
+// attempt: the completed work was never verified, and the cycle cap started
+// over. A task that has never had a worker has cycle 0, which is what
+// distinguishes the two.
+func ResumeStep(ts *state.TaskState) (config.Role, int) {
+	if ts == nil || ts.Cycle < 1 {
+		return config.RoleImplementer, 1
+	}
+	if config.Role(ts.Role) == config.RoleVerifier {
+		return config.RoleVerifier, ts.Cycle
+	}
+	return config.RoleImplementer, ts.Cycle
+}
+
 // AfterVerifyFailed decides what happens when a verification pass fails.
 func AfterVerifyFailed(ts *state.TaskState, cfg *config.Config) Plan {
 	cycle, allowed := NextImplementerCycle(ts, cfg)
@@ -271,6 +290,42 @@ func ApplySelfAuthoredControl(c *report.CriterionResult, res negctl.Result) {
 		c.Evaluation = report.EvalJudged
 		c.DowngradeReason = res.Reason
 	}
+}
+
+// DowngradeUncontrolled turns every criterion the control run never reached
+// into a judged one, and names them.
+//
+// A control that could not run is not a control that passed. Letting the
+// error through left the verifier's provisional claims standing and a task
+// reaching ready_for_review advertising "N mechanical / 0 judged" with
+// nothing having been controlled at all — the one thing that ratio must never
+// be able to say.
+//
+// The control records a classification or a status on everything it touches,
+// so what is left unmarked is exactly what the failure waived. Two kinds are
+// deliberately left alone. A criterion already failing on its own exit code
+// stays failing: downgrading it to judgment would let the verifier's met
+// claim rescue it, turning a missing control into an amnesty. A
+// negative-control criterion carries no crew finding either, so it already
+// fails of its own accord and needs nothing added.
+func DowngradeUncontrolled(r *report.Verifier, cause error) []string {
+	var downgraded []string
+	for i := range r.CriteriaResults {
+		c := &r.CriteriaResults[i]
+		switch {
+		case c.Evaluation != report.EvalMechanical:
+			continue
+		case c.Classification != "" || c.NegativeControlStatus != "":
+			continue // the run reached this one before it failed
+		case c.ExitCode != nil && *c.ExitCode != 0:
+			continue // already unsatisfied on its own numbers
+		}
+		c.Evaluation = report.EvalJudged
+		c.NegativeControlStatus = "not_run"
+		c.DowngradeReason = "the negative control could not run: " + cause.Error()
+		downgraded = append(downgraded, c.Description)
+	}
+	return downgraded
 }
 
 // MarkUnattributable records that a mechanical criterion could not be tied to

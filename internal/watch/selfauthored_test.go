@@ -1,6 +1,8 @@
 package watch
 
 import (
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -374,5 +376,100 @@ func TestDiscriminatingCriterionNeverSuggestsARetag(t *testing.T) {
 	ts := st.Tasks["alpha"]
 	if got := ts.DegradedCount("Allow returns false once the bucket is exhausted."); got != 0 {
 		t.Fatalf("DegradedCount = %d, want 0 for a criterion that produces evidence", got)
+	}
+}
+
+// writeVerifierReport puts a verifier's report where the loop reads it.
+func writeVerifierReport(t *testing.T, worktree string, r *report.Verifier) {
+	t.Helper()
+	raw, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, report.Path(worktree), string(raw))
+}
+
+// A control that could not run is not a control that passed.
+//
+// The error was recorded un-notified and the verifier's provisional claims
+// stood, so a pass in which nothing was ever controlled reached the captain
+// advertising a clean mechanical ratio.
+func TestAFailedControlRunDoesNotWaiveEveryControl(t *testing.T) {
+	l := selfAuthoredFixture(t, vacuousTest)
+	// A transient git failure, in the shape the loop actually sees one.
+	l.Cfg.MainBranch = "no-such-branch"
+
+	var notified []state.Event
+	l.Notify = func(ev state.Event) { notified = append(notified, ev) }
+	writeVerifierReport(t, WorktreePath(l.Root, "alpha", 1), verifierClaim())
+
+	if err := l.completeVerifier("alpha"); err != nil {
+		t.Fatalf("completeVerifier: %v", err)
+	}
+
+	var failure, ready *state.Event
+	for i, ev := range notified {
+		switch ev.Kind {
+		case "negative_control_failed":
+			failure = &notified[i]
+		case "ready_for_review":
+			ready = &notified[i]
+		}
+	}
+	if failure == nil {
+		t.Fatalf("the control failure was never notified; notified = %+v", notified)
+	}
+	if !strings.Contains(failure.Detail, "merge base") {
+		t.Errorf("Detail = %q, want it to name the cause", failure.Detail)
+	}
+	if ready == nil {
+		t.Fatal("no ready_for_review event")
+	}
+	if ready.Ratio != "0 mechanical / 1 judged" {
+		t.Errorf("ratio = %q, want %q: a pass with no control run reported mechanical evidence",
+			ready.Ratio, "0 mechanical / 1 judged")
+	}
+}
+
+// The downgrade must not become an amnesty: a check that failed on its own
+// numbers stays failed whether or not a control could run.
+func TestAFailedControlRunDoesNotRescueAFailingCheck(t *testing.T) {
+	r := verifierClaim()
+	r.CriteriaResults[0].ExitCode = intp(1)
+
+	if got := DowngradeUncontrolled(r, errors.New("resolve merge base")); len(got) != 0 {
+		t.Fatalf("downgraded = %v, want none", got)
+	}
+	if r.CriteriaResults[0].Satisfied() {
+		t.Fatal("a failing check was rescued by a control that could not run")
+	}
+}
+
+// Criteria the run did reach keep the finding it produced; only what was
+// waived is downgraded.
+func TestOnlyUncontrolledCriteriaAreDowngraded(t *testing.T) {
+	r := &report.Verifier{
+		TaskID: "alpha", Role: "verifier", Status: report.StatusSatisfied,
+		CriteriaResults: []report.CriterionResult{
+			{Description: "controlled", Evaluation: report.EvalMechanical,
+				Command: "crew-check test", ExitCode: intp(0), Met: boolp(true),
+				Classification: "discriminating"},
+			{Description: "waived", Evaluation: report.EvalMechanical,
+				Command: "crew-check test", ExitCode: intp(0), Met: boolp(true)},
+			{Description: "judged all along", Evaluation: report.EvalJudged, Met: boolp(true)},
+		},
+	}
+	got := DowngradeUncontrolled(r, errors.New("resolve merge base"))
+	if len(got) != 1 || got[0] != "waived" {
+		t.Fatalf("downgraded = %v, want [waived]", got)
+	}
+	if r.CriteriaResults[0].Evaluation != report.EvalMechanical {
+		t.Error("a criterion the control did reach was downgraded")
+	}
+	if r.CriteriaResults[1].NegativeControlStatus != "not_run" {
+		t.Errorf("NegativeControlStatus = %q, want not_run", r.CriteriaResults[1].NegativeControlStatus)
+	}
+	if m, j := r.Ratio(); m != 1 || j != 2 {
+		t.Errorf("ratio = %d mechanical / %d judged, want 1 / 2", m, j)
 	}
 }

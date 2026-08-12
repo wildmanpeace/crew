@@ -110,6 +110,25 @@ func TestReadExitReportsNotDoneBeforeCompletion(t *testing.T) {
 	}
 }
 
+// A marker that cannot be parsed must be distinguishable from one that has
+// not been written yet, and must never be read as a clean exit: the caller
+// decides what to do about it, and it can only do that if it is told.
+func TestReadExitReportsACorruptMarkerAsAnError(t *testing.T) {
+	runs := t.TempDir()
+	for _, body := range []string{"", "0\x00tr", "not-a-number\n"} {
+		if err := os.WriteFile(filepath.Join(runs, "alpha.exit"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		code, done, err := ReadExit(runs, "alpha")
+		if err == nil {
+			t.Fatalf("marker %q read as (%d, %v), want an error", body, code, done)
+		}
+		if done {
+			t.Errorf("marker %q was reported complete despite being unreadable", body)
+		}
+	}
+}
+
 // The raw CLI output is kept for forensics and cost auditing.
 func TestRunOncePersistsRawOutput(t *testing.T) {
 	dir := t.TempDir()

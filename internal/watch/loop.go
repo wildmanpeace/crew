@@ -14,6 +14,7 @@ import (
 	"github.com/wildmanpeace/crew/internal/budget"
 	"github.com/wildmanpeace/crew/internal/config"
 	"github.com/wildmanpeace/crew/internal/gitx"
+	"github.com/wildmanpeace/crew/internal/report"
 	"github.com/wildmanpeace/crew/internal/state"
 	"github.com/wildmanpeace/crew/internal/tmux"
 	"github.com/wildmanpeace/crew/internal/worker"
@@ -102,9 +103,16 @@ func Lock(root string) (release func() error, err error) {
 	f.Truncate(0)
 	fmt.Fprintf(f, "%d\n", os.Getpid())
 	return func() error {
+		// The file is unlinked while the lock is still held. Unlocking first
+		// left a window in which one starter could acquire the old inode
+		// through the path and another, after the unlink, could create and
+		// acquire a new one — two watches, both believing they were the only
+		// one. Unlinking first means a newcomer can only ever create a fresh
+		// inode, and only one of them can hold that.
+		err := os.Remove(path)
 		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
-		return os.Remove(path)
+		return err
 	}, nil
 }
 
@@ -154,28 +162,72 @@ func (l *Loop) Repair() error {
 		return err
 	}
 	for _, ts := range st.PendingIntents() {
-		intent := ts.PendingIntent
-		if intent.Action != state.IntentSpawnWindow {
-			continue
-		}
-		windowLive, _ := tmux.WindowExists(l.Session, intent.Window)
-		_, runDone, _ := worker.ReadExit(l.runsDir(), intent.RunID)
-
-		switch {
-		case runDone:
-			// The effect completed; the normal completion path will pick it up.
-			l.clearIntent(ts.ID, "")
-		case windowLive:
-			// The effect happened and is still going.
-			l.clearIntent(ts.ID, state.StatusRunning)
-		default:
-			// The effect never happened.
-			l.clearIntent(ts.ID, state.StatusQueued)
-			l.record(state.Event{TaskID: ts.ID, Kind: "repaired",
-				Detail: fmt.Sprintf("spawn intent for run %s never took effect; returned to queued", intent.RunID)})
+		switch ts.PendingIntent.Action {
+		case state.IntentSpawnWindow:
+			l.repairSpawnWindow(ts)
+		case state.IntentCreateWorktr:
+			l.repairCreateWorktree(ts)
 		}
 	}
 	return nil
+}
+
+func (l *Loop) repairSpawnWindow(ts *state.TaskState) {
+	intent := ts.PendingIntent
+	windowLive, _ := tmux.WindowExists(l.Session, intent.Window)
+	_, runDone, _ := worker.ReadExit(l.runsDir(), intent.RunID)
+
+	switch {
+	case runDone:
+		// The effect completed; the normal completion path will pick it up.
+		l.clearIntent(ts.ID, "")
+	case windowLive:
+		// The effect happened and is still going.
+		l.clearIntent(ts.ID, state.StatusRunning)
+	default:
+		// The effect never happened.
+		l.clearIntent(ts.ID, state.StatusQueued)
+		l.record(state.Event{TaskID: ts.ID, Kind: "repaired",
+			Detail: fmt.Sprintf("spawn intent for run %s never took effect; returned to queued", intent.RunID)})
+	}
+}
+
+// repairCreateWorktree reconciles a crew spawn that crashed between recording
+// its intent and creating the branch and worktree.
+//
+// Leaving this unhandled was worse than leaving one task stranded: crew doctor
+// reports any unfinished intent, and any doctor finding refuses every spawn,
+// so a crash in that window wedged all future work behind a finding no restart
+// could clear — while doctor told the captain a restart was the fix.
+func (l *Loop) repairCreateWorktree(ts *state.TaskState) {
+	intent := ts.PendingIntent
+	branchLive, _ := l.Repo.BranchExists(intent.Branch)
+	_, statErr := os.Stat(intent.Worktree)
+
+	if branchLive && statErr == nil {
+		// The effect completed; only the record of it was lost.
+		l.clearIntent(ts.ID, state.StatusQueued)
+		l.record(state.Event{TaskID: ts.ID, Kind: "repaired",
+			Detail: fmt.Sprintf("worktree intent for %s had completed; queued", intent.Branch)})
+		return
+	}
+
+	// A half-made attempt is rolled back rather than forward: crew spawn
+	// refuses a branch or worktree that already exists, so anything left
+	// behind would refuse the task for good.
+	if statErr == nil {
+		if err := l.Repo.RemoveWorktree(intent.Worktree); err != nil {
+			os.RemoveAll(intent.Worktree)
+		}
+	}
+	l.Repo.PruneWorktrees()
+	if branchLive {
+		l.Repo.DeleteBranch(intent.Branch, true)
+	}
+	l.clearIntent(ts.ID, state.StatusPending)
+	l.record(state.Event{TaskID: ts.ID, Kind: "repaired",
+		Detail: fmt.Sprintf("worktree intent for %s never completed; cleaned up, crew spawn can run again",
+			intent.Branch)})
 }
 
 func (l *Loop) clearIntent(taskID string, newStatus state.Status) {
@@ -226,17 +278,28 @@ func (l *Loop) Tick(ctx context.Context) error {
 		}
 		ts := st.Tasks[id]
 		code, done, err := worker.ReadExit(l.runsDir(), ts.RunID)
-		if err != nil {
-			continue
-		}
-		if done {
+		switch {
+		case err != nil:
+			// The marker is written last and by atomic rename, so one that
+			// cannot be read means the run is over and its outcome is lost.
+			// Skipping the task instead left it in running forever: it held a
+			// concurrency slot, reconcile was never reached so the wall clock
+			// could not fire either, and nothing was recorded to say why.
+			l.record(state.Event{TaskID: id, Kind: "watch_error",
+				Detail: fmt.Sprintf("exit marker for run %s: %v", ts.RunID, err)})
+			l.failRun(id, ts, fmt.Sprintf(
+				"worker %s left an unreadable exit marker, so its outcome cannot be recovered: %v",
+				ts.RunID, err), "exit_marker_unreadable")
+
+		case done:
 			if err := l.onWorkerExit(id, code); err != nil {
 				l.record(state.Event{TaskID: id, Kind: "watch_error", Detail: err.Error()})
 			}
-			continue
-		}
-		if err := l.reconcileActive(id, ts); err != nil {
-			l.record(state.Event{TaskID: id, Kind: "watch_error", Detail: err.Error()})
+
+		default:
+			if err := l.reconcileActive(id, ts); err != nil {
+				l.record(state.Event{TaskID: id, Kind: "watch_error", Detail: err.Error()})
+			}
 		}
 	}
 
@@ -244,7 +307,7 @@ func (l *Loop) Tick(ctx context.Context) error {
 		l.record(state.Event{Kind: "watch_error", Detail: err.Error()})
 	}
 
-	// Start the first implementer for anything queued. crew spawn prepares the
+	// Start whatever anything queued is waiting on. crew spawn prepares the
 	// branch and worktree and stops; every worker is started here, so there is
 	// exactly one place that spawns.
 	return l.startQueued(ctx)
@@ -304,7 +367,7 @@ func (l *Loop) deferLand(taskID string, cause error) {
 	l.emit(state.Event{TaskID: taskID, Kind: "land_deferred", Detail: cause.Error()})
 }
 
-// startQueued spawns the first implementer of each queued task, subject to the
+// startQueued starts the next worker of each queued task, subject to the
 // concurrency cap. Budget is checked inside SpawnWorker, before the spawn.
 func (l *Loop) startQueued(ctx context.Context) error {
 	st, err := l.Store.Read()
@@ -332,16 +395,52 @@ func (l *Loop) startQueued(ctx context.Context) error {
 		if !ok {
 			continue
 		}
-		t, err := l.Task(id)
-		if err != nil {
-			l.blockTask(id, err.Error())
-			continue
-		}
-		if err := l.SpawnWorker(id, config.RoleImplementer, 1, ImplementerBrief(t, 1, nil)); err != nil {
+		if err := l.startTask(id, st.Tasks[id]); err != nil {
 			l.record(state.Event{TaskID: id, Kind: "watch_error", Detail: err.Error()})
 		}
 	}
 	return nil
+}
+
+// startTask spawns the step a queued task is waiting on.
+//
+// It is the resume point as well as the start point: a spawn that failed
+// transiently returns its task to queued with the role and cycle it was
+// attempting still recorded, and that step is what must be retried.
+func (l *Loop) startTask(taskID string, ts *state.TaskState) error {
+	role, cycle := ResumeStep(ts)
+	if role == config.RoleVerifier {
+		// spawnVerifier rebuilds the brief from the diff, so a resumed
+		// verifier is briefed exactly as the one it is replacing was.
+		return l.spawnVerifier(taskID)
+	}
+	t, err := l.Task(taskID)
+	if err != nil {
+		l.blockTask(taskID, err.Error())
+		return nil
+	}
+	return l.SpawnWorker(taskID, config.RoleImplementer, cycle,
+		ImplementerBrief(t, cycle, l.resumeFailures(taskID, ts, cycle)))
+}
+
+// resumeFailures recovers the unmet criteria a retried implementer was to be
+// briefed on.
+//
+// The brief is rebuilt from the verifier report still sitting in the worktree
+// rather than carried in state, so a resumed cycle is told what the one it
+// replaces would have been told. A first cycle has no verifier behind it, and
+// an unreadable or non-verifier report simply yields nothing.
+func (l *Loop) resumeFailures(taskID string, ts *state.TaskState, cycle int) []string {
+	if cycle <= 1 || ts == nil {
+		return nil
+	}
+	r, err := report.LoadVerifierWithSuffix(WorktreePath(l.Root, taskID, ts.Attempt),
+		l.Cfg.VerifyTestSuffix)
+	if err != nil || r == nil {
+		return nil
+	}
+	_, failures := Outcome(r)
+	return failures
 }
 
 func isActive(s state.Status) bool {
@@ -524,6 +623,39 @@ func CleanVerifyTests(worktree, suffix string) ([]string, error) {
 		return nil
 	})
 	return removed, err
+}
+
+// UncommittedWork lists the implementer's own uncommitted changes in a task
+// worktree.
+//
+// Two kinds of file are excluded because they are never meant to be
+// committed and always present: the verifier's tests, which it has no way to
+// commit and which crew deletes between cycles, and the report a worker
+// writes on its way out. What is left is work that review and verify can see
+// but approve and land cannot.
+func UncommittedWork(worktree, verifySuffix string) ([]string, error) {
+	args := []string{"status", "--porcelain", "--", ".",
+		":(exclude)" + report.Filename, ":(exclude).crew"}
+	if verifySuffix != "" {
+		args = append(args, ":(exclude)*"+verifySuffix)
+	}
+	out, err := gitx.New(worktree).Run(args...)
+	if err != nil {
+		return nil, fmt.Errorf("read worktree status: %w", err)
+	}
+	var files []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Porcelain lines are "XY path"; the status letters never contain a
+		// space once the line is trimmed.
+		if _, path, ok := strings.Cut(line, " "); ok {
+			files = append(files, strings.TrimSpace(path))
+		}
+	}
+	return files, nil
 }
 
 // BranchName is the branch for a task attempt. Branches are namespaced by

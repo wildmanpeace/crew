@@ -216,3 +216,39 @@ func TestUnattributableAndPreExistingAreRecorded(t *testing.T) {
 		t.Error("a pre-existing test's criterion should stand")
 	}
 }
+
+// -run takes a regexp, so a filter carrying pattern syntax or shell quoting
+// can never match a literal declaration. Reading that miss as "the test
+// predates this branch" waived the control for a test the branch did author —
+// exactly backwards, and silent. It is reported as unattributable instead.
+func TestAttributionDoesNotReadAnUnmatchableFilterAsPreExisting(t *testing.T) {
+	wt := t.TempDir()
+	writeTest(t, wt, "ratelimit/bucket_test.go",
+		"package ratelimit\n\nfunc TestAllowRefusesWhenEmpty(t *testing.T) {}\n")
+
+	for _, filter := range []string{"TestAllowRefusesWhenEmpty$", "^TestAllowRefusesWhenEmpty$",
+		"'TestAllowRefusesWhenEmpty'", "TestAllow.*Empty", "TestAllowRefusesWhenEmpty/subcase"} {
+		got := AttributeCriterion(wt,
+			"crew-check test ./ratelimit/... -run "+filter,
+			[]string{"ratelimit/bucket_test.go"})
+		if got.Authorship != AuthorUnknown {
+			t.Errorf("filter %q: Authorship = %q, want %q; a branch-authored test was waived as pre-existing",
+				filter, got.Authorship, AuthorUnknown)
+		}
+	}
+}
+
+// A plain name that genuinely matches nothing the branch touched still means
+// what it always did, or every criterion would become unattributable.
+func TestAttributionStillRecognisesAGenuinelyPreExistingTest(t *testing.T) {
+	wt := t.TempDir()
+	writeTest(t, wt, "ratelimit/bucket_test.go",
+		"package ratelimit\n\nfunc TestSomethingElse(t *testing.T) {}\n")
+
+	got := AttributeCriterion(wt,
+		"crew-check test ./ratelimit/... -run TestSomethingOlder",
+		[]string{"ratelimit/bucket_test.go"})
+	if got.Authorship != AuthorPreExisting {
+		t.Fatalf("Authorship = %q, want %q", got.Authorship, AuthorPreExisting)
+	}
+}

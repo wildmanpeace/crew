@@ -254,7 +254,15 @@ func (l *Loop) completeVerifier(taskID string) error {
 
 	if r != nil && loadErr == nil {
 		if err := l.runNegativeControls(taskID, r); err != nil {
-			l.record(state.Event{TaskID: taskID, Kind: "watch_error", Detail: err.Error()})
+			// A control that could not run is not a control that passed.
+			// Recording the error and carrying on left every provisional claim
+			// standing, so a transient git failure silently waived the whole
+			// pass and still reported it as mechanical evidence.
+			downgraded := DowngradeUncontrolled(r, err)
+			l.emit(state.Event{TaskID: taskID, Kind: "negative_control_failed",
+				Detail: fmt.Sprintf("%v; %d criterion(s) fall back to judgment",
+					err, len(downgraded)),
+				Payload: downgraded})
 		}
 		l.persistCriteria(taskID, r)
 	}
@@ -264,6 +272,23 @@ func (l *Loop) completeVerifier(taskID string) error {
 
 	switch plan.Action {
 	case ActionReadyForReview:
+		// Review and verify look at the working tree, but approve and land
+		// bind the committed branch head. An implementer's edits after its
+		// last crew-run commit would otherwise be reviewed, verified and
+		// approved, then silently dropped at land time. The task goes back to
+		// an implementer rather than being blocked, because committing the
+		// work is something the implementer can still do.
+		if dirty, err := UncommittedWork(worktree, l.Cfg.VerifyTestSuffix); err != nil {
+			// A status that cannot be read is recorded rather than treated as
+			// dirty; crew approve re-checks the sha it is binding.
+			l.record(state.Event{TaskID: taskID, Kind: "watch_error",
+				Detail: "check task worktree is clean: " + err.Error()})
+		} else if len(dirty) > 0 {
+			l.record(state.Event{TaskID: taskID, Kind: "uncommitted_work",
+				Detail: "not sent for review: " + strings.Join(dirty, ", "), Payload: dirty})
+			return l.nextImplementer(taskID, []string{uncommittedFailure(dirty)})
+		}
+
 		head, _ := l.Repo.RevParse(BranchName(taskID, ts.Attempt))
 		l.Store.Update(func(st *state.State) error {
 			t := st.Tasks[taskID]
@@ -298,6 +323,14 @@ func (l *Loop) completeVerifier(taskID string) error {
 }
 
 const verifierRetryMarker = "crew:verifier-retried"
+
+// uncommittedFailure briefs the next implementer on work that never reached a
+// commit, in the same shape as any other unmet criterion.
+func uncommittedFailure(dirty []string) string {
+	return fmt.Sprintf(
+		"work is not committed, so it would be reviewed but never landed: %s; finish with crew-run commit",
+		strings.Join(dirty, ", "))
+}
 
 // nextImplementer starts the next cycle, clearing verifier-authored tests
 // first so the new implementer neither sees them nor can write to them.
@@ -364,7 +397,8 @@ func (l *Loop) runNegativeControls(taskID string, r *report.Verifier) error {
 			if c.TestFile == "" {
 				continue
 			}
-			if err := l.controlFor(taskID, branch, c, c.TestFile, scopeArgs(c.TestFile), false); err != nil {
+			if err := l.controlFor(taskID, branch, worktree, c, c.TestFile,
+				scopeArgs(c.TestFile), false); err != nil {
 				return err
 			}
 
@@ -374,7 +408,8 @@ func (l *Loop) runNegativeControls(taskID string, r *report.Verifier) error {
 			case AuthorBranch:
 				// Run exactly the check the verifier ran, against a tree with
 				// the implementation removed.
-				if err := l.controlFor(taskID, branch, c, target.File, target.RunArgs, true); err != nil {
+				if err := l.controlFor(taskID, branch, worktree, c, target.File,
+					target.RunArgs, true); err != nil {
 					return err
 				}
 			case AuthorUnknown:
@@ -388,7 +423,11 @@ func (l *Loop) runNegativeControls(taskID string, r *report.Verifier) error {
 }
 
 // controlFor runs one negative control and applies its finding.
-func (l *Loop) controlFor(taskID, branch string, c *report.CriterionResult,
+//
+// The task worktree is passed through because a verifier-authored test lives
+// only there: it is never committed, so the control has to be given the file
+// rather than expecting to find it on the branch.
+func (l *Loop) controlFor(taskID, branch, worktree string, c *report.CriterionResult,
 	testFile string, testArgs []string, selfAuthored bool) error {
 
 	argv, err := l.Cfg.Resolve("test", testArgs)
@@ -399,6 +438,7 @@ func (l *Loop) controlFor(taskID, branch string, c *report.CriterionResult,
 		Repo:                l.Repo,
 		MainBranch:          l.Cfg.MainBranch,
 		Branch:              branch,
+		SourceWorktree:      worktree,
 		TestFile:            testFile,
 		TestArgv:            argv,
 		BuildFailureMarkers: l.Cfg.NegativeControlBuildFailureMarkers,

@@ -249,6 +249,238 @@ func step(cost float64, report map[string]any) map[string]any {
 	return s
 }
 
+// The implementer's work: a change to pre-existing API, so a test written
+// against it compiles at the merge base as well as at head.
+const e2eImplementation = "package ratelimit\n\nfunc Allow() bool { return false }\n"
+
+// The verifier's test. It is deliberately never committed: crew-check has no
+// commit verb and the hook denies raw git, so this is the only state a
+// verifier-authored test can be in when the control runs.
+const e2eVerifyTest = `package ratelimit
+
+import "testing"
+
+func TestAllowRefusesWhenEmpty(t *testing.T) {
+	if Allow() {
+		t.Fatal("Allow returned true with an empty bucket")
+	}
+}
+`
+
+const e2eVerifyTestFile = "ratelimit/empty_crewverify_test.go"
+
+// implStep is an implementer that actually writes and commits its work.
+func implStep(cost float64) map[string]any {
+	s := step(cost, implReport("done"))
+	s["files"] = map[string]string{"ratelimit/bucket.go": e2eImplementation}
+	s["commit"] = true
+	return s
+}
+
+// negControlStep is a verifier that writes a real test and claims a
+// negative-control criterion against it. The claim is provisional; crew's own
+// control is what decides.
+func negControlStep(cost float64) map[string]any {
+	s := step(cost, map[string]any{
+		"task_id": "alpha", "role": "verifier", "status": "satisfied",
+		"criteria_results": []map[string]any{{
+			"description": "Allow refuses when the bucket is empty.",
+			"evaluation":  "negative_control_test",
+			"test_file":   e2eVerifyTestFile,
+			"met":         true,
+			"notes":       "wrote a test that fails without the change",
+		}},
+		"finished_at": time.Now().UTC().Format(time.RFC3339),
+	})
+	s["files"] = map[string]string{e2eVerifyTestFile: e2eVerifyTest}
+	return s
+}
+
+// events returns everything crew has recorded, in order.
+func (h *harness) events() []state.Event {
+	h.t.Helper()
+	raw, err := os.ReadFile(filepath.Join(h.root, ".crew", "events.jsonl"))
+	if err != nil {
+		h.t.Fatalf("read events: %v", err)
+	}
+	var out []state.Event
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var ev state.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			h.t.Fatalf("parse event %q: %v", line, err)
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+func (h *harness) eventsOfKind(kind string) []state.Event {
+	h.t.Helper()
+	var out []state.Event
+	for _, ev := range h.events() {
+		if ev.Kind == kind {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// The flagship guarantee, driven end to end: a verifier-authored negative
+// control must be measured against the verifier's own test.
+//
+// The verifier writes its test into the task worktree and cannot commit it, so
+// before this the scratch worktree — built from the committed branch head —
+// never contained it. Both phases ran the implementer's committed tests
+// instead, of which there are none here, so the control concluded
+// "passes_at_merge_base" about a test it had never executed and the criterion
+// failed unfixably. Nothing in the suite exercised this shape, which is why it
+// shipped green.
+func TestVerifierAuthoredNegativeControlIsMeasuredAgainstTheVerifiersOwnTest(t *testing.T) {
+	h := newHarness(t, []map[string]any{
+		implStep(0.10),
+		negControlStep(0.05),
+	})
+	h.start("alpha")
+	ts := h.settle("alpha", state.StatusReadyForReview, state.StatusNeedsReframe,
+		state.StatusBlocked, state.StatusFailed)
+
+	controls := h.eventsOfKind("negative_control")
+	if len(controls) != 1 {
+		t.Fatalf("recorded %d negative controls, want exactly 1: %+v", len(controls), controls)
+	}
+	payload, ok := controls[0].Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("negative control payload = %T", controls[0].Payload)
+	}
+	if got := payload["classification"]; got != "discriminating" {
+		t.Errorf("classification = %v, want discriminating; the verifier's test was not in the control\n"+
+			"merge-base output:\n%v", got, payload["merge_base_output"])
+	}
+	if got := payload["test_file"]; got != e2eVerifyTestFile {
+		t.Errorf("test_file = %v, want %s", got, e2eVerifyTestFile)
+	}
+	// The proof the verifier's assertion actually ran: its failure text can
+	// only appear if the file was present in the reverted tree.
+	if out, _ := payload["merge_base_output"].(string); !strings.Contains(out, "Allow returned true") {
+		t.Errorf("the verifier's assertion never ran in the control:\n%s", out)
+	}
+
+	if ts.Status != state.StatusReadyForReview {
+		t.Fatalf("Status = %q, want ready_for_review: %s", ts.Status, ts.Notes)
+	}
+	ready := h.eventsOfKind("ready_for_review")
+	if len(ready) == 0 {
+		t.Fatal("no ready_for_review event")
+	}
+	if got := ready[len(ready)-1].Ratio; got != "1 mechanical / 0 judged" {
+		t.Errorf("ratio = %q, want %q", got, "1 mechanical / 0 judged")
+	}
+	if ts.Cycle != 1 {
+		t.Errorf("Cycle = %d, want 1; the control sent real work back", ts.Cycle)
+	}
+}
+
+// Review and verify look at the working tree; approve and land bind the
+// committed branch head. An implementer's final edit that never reached a
+// crew-run commit was therefore reviewed, verified and approved, and then
+// silently dropped at land time. The reviewed artifact has to be the one that
+// lands, so the transition is refused while the worktree is dirty and the task
+// goes back to an implementer that can still commit it.
+func TestUncommittedImplementerWorkIsNotSentForReview(t *testing.T) {
+	leaky := implStep(0.10)
+	leaky["uncommitted"] = map[string]string{
+		"ratelimit/bucket.go": e2eImplementation + "\n// a final edit that never reached crew-run commit\n",
+	}
+	h := newHarness(t, []map[string]any{
+		leaky,
+		negControlStep(0.05),
+		implStep(0.10), // the next cycle commits everything it wrote
+		negControlStep(0.05),
+	})
+	h.start("alpha")
+	ts := h.settle("alpha", state.StatusReadyForReview, state.StatusNeedsReframe,
+		state.StatusBlocked, state.StatusFailed)
+
+	if len(h.eventsOfKind("uncommitted_work")) == 0 {
+		t.Fatalf("a dirty worktree passed straight through to review; events: %+v", h.events())
+	}
+	if ts.Status != state.StatusReadyForReview {
+		t.Fatalf("Status = %q, want ready_for_review after the work was committed: %s", ts.Status, ts.Notes)
+	}
+	if ts.Cycle != 2 {
+		t.Fatalf("Cycle = %d, want 2; the task was not returned to an implementer", ts.Cycle)
+	}
+
+	// What the captain reviews must now be what lands.
+	wt := gitx.New(watch.WorktreePath(h.root, "alpha", 1))
+	clean, err := wt.IsCleanExcluding("*_crewverify_test.go", ".crew-report.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !clean {
+		out, _ := wt.Run("status", "--porcelain")
+		t.Fatalf("ready_for_review with uncommitted work still present:\n%s", out)
+	}
+}
+
+// The verifier's own test is never committed and never can be, so it must not
+// be mistaken for uncommitted implementation work — that would send every task
+// back for another cycle, forever.
+func TestTheVerifiersOwnTestDoesNotCountAsUncommittedWork(t *testing.T) {
+	h := newHarness(t, []map[string]any{implStep(0.10), negControlStep(0.05)})
+	h.start("alpha")
+	ts := h.settle("alpha", state.StatusReadyForReview, state.StatusNeedsReframe,
+		state.StatusBlocked, state.StatusFailed)
+
+	if evs := h.eventsOfKind("uncommitted_work"); len(evs) > 0 {
+		t.Fatalf("the verifier's own test was treated as uncommitted work: %+v", evs)
+	}
+	if ts.Status != state.StatusReadyForReview {
+		t.Fatalf("Status = %q, want ready_for_review: %s", ts.Status, ts.Notes)
+	}
+}
+
+// The other half of the guarantee: a verifier test that passes with the
+// implementation taken away must be caught. It is the same path as the test
+// above, so a copy-in that happened to leave the file out of the revert would
+// pass one and fail the other.
+func TestAVacuousVerifierTestIsCaughtByTheControl(t *testing.T) {
+	vacuous := negControlStep(0.05)
+	vacuous["files"] = map[string]string{e2eVerifyTestFile: `package ratelimit
+
+import "testing"
+
+func TestAllowIsCallable(t *testing.T) {
+	_ = Allow()
+}
+`}
+	h := newHarness(t, []map[string]any{
+		implStep(0.10),
+		vacuous,
+		implStep(0.10),
+		negControlStep(0.05),
+	})
+	h.start("alpha")
+	ts := h.settle("alpha", state.StatusReadyForReview, state.StatusNeedsReframe)
+
+	controls := h.eventsOfKind("negative_control")
+	if len(controls) == 0 {
+		t.Fatal("no negative control ran")
+	}
+	first, _ := controls[0].Payload.(map[string]any)
+	if got := first["classification"]; got != "passes_at_merge_base" {
+		t.Fatalf("classification = %v, want passes_at_merge_base", got)
+	}
+	// A vacuous test is a verify failure, so the task must have gone back for
+	// another cycle rather than passing on the verifier's own say-so.
+	if ts.Cycle != 2 {
+		t.Fatalf("Cycle = %d, want 2; a test that cannot fail was accepted as evidence", ts.Cycle)
+	}
+}
+
 // The happy path, end to end through real tmux windows.
 func TestLoopReachesReadyForReview(t *testing.T) {
 	h := newHarness(t, []map[string]any{
@@ -392,6 +624,43 @@ func TestSpawnIsRefusedOnceTheTaskCapIsSpent(t *testing.T) {
 	}
 }
 
+// A transient spawn failure returns the task to queued. Before this, the next
+// poll always started a cycle-1 implementer, so a verifier that failed to
+// spawn silently became a fresh implementation attempt: the work already done
+// was never verified and the cycle cap started over.
+func TestAFailedVerifierSpawnResumesTheVerifierNotAFreshImplementer(t *testing.T) {
+	h := newHarness(t, []map[string]any{
+		{"cost_usd": 0.01, "exit": 0, "sleep_seconds": 30, "no_report": true},
+	})
+	if err := h.app.Spawn("alpha", false); err != nil {
+		t.Fatal(err)
+	}
+	// The shape a failed worker.Spawn leaves behind: back to queued, with the
+	// role and cycle the spawn was attempting still recorded.
+	h.loop.Store.Update(func(st *state.State) error {
+		ts := st.Tasks["alpha"]
+		ts.Status = state.StatusQueued
+		ts.Role = string(config.RoleVerifier)
+		ts.Cycle = 2
+		return nil
+	})
+	if err := h.loop.Tick(t.Context()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	st, _ := h.loop.Store.Read()
+	ts := st.Tasks["alpha"]
+	if ts.Role != string(config.RoleVerifier) {
+		t.Fatalf("Role = %q, want verifier; the failed verifier spawn restarted as an implementer", ts.Role)
+	}
+	if ts.Cycle != 2 {
+		t.Fatalf("Cycle = %d, want 2; the cycle cap restarted", ts.Cycle)
+	}
+	if ts.RunID != "alpha-a1-c2-verify" {
+		t.Errorf("RunID = %q, want alpha-a1-c2-verify", ts.RunID)
+	}
+}
+
 // A crash between recording a spawn intent and creating the window must be
 // repaired, not left stranded.
 func TestCrashBetweenIntentAndEffectIsRepaired(t *testing.T) {
@@ -421,6 +690,110 @@ func TestCrashBetweenIntentAndEffectIsRepaired(t *testing.T) {
 	}
 	if ts.PendingIntent != nil {
 		t.Error("intent survived repair")
+	}
+}
+
+// A crash between recording the create-worktree intent and creating it left a
+// dangling intent Repair did not know about, while crew doctor claimed a
+// restart would clear it. Any doctor finding refuses every spawn, so this
+// wedged all future work behind a finding no restart could ever clear.
+func TestCrashBeforeTheWorktreeExistsIsCleanedUpNotWedged(t *testing.T) {
+	h := newHarness(t, []map[string]any{step(0.10, implReport("done"))})
+	branch, worktree := watch.BranchName("alpha", 1), watch.WorktreePath(h.root, "alpha", 1)
+	h.loop.Store.Update(func(st *state.State) error {
+		st.Upsert(&state.TaskState{
+			ID: "alpha", Status: state.StatusPending, Attempt: 1,
+			Branch: branch, Worktree: worktree,
+			PendingIntent: &state.Intent{
+				Action: state.IntentCreateWorktr, Branch: branch, Worktree: worktree,
+			},
+		})
+		return nil
+	})
+
+	if err := h.loop.Repair(); err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+	st, _ := h.loop.Store.Read()
+	if st.Tasks["alpha"].PendingIntent != nil {
+		t.Fatal("the create-worktree intent survived repair")
+	}
+
+	// Doctor must come back clean, or every future spawn stays refused.
+	problems, err := h.app.DoctorFindings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range problems {
+		t.Errorf("doctor still failing after repair: %s: %s", p.TaskID, p.Detail)
+	}
+	// The proof that matters: the task can be spawned again.
+	if err := h.app.Spawn("alpha", false); err != nil {
+		t.Fatalf("Spawn after repair: %v", err)
+	}
+}
+
+// The other outcome of the same crash: the worktree was created and only the
+// intent was left behind. Rolling that back would throw away a good worktree.
+func TestACompletedWorktreeIntentIsRolledForward(t *testing.T) {
+	h := newHarness(t, []map[string]any{step(0.10, implReport("done"))})
+	if err := h.app.Spawn("alpha", false); err != nil {
+		t.Fatal(err)
+	}
+	h.loop.Store.Update(func(st *state.State) error {
+		ts := st.Tasks["alpha"]
+		ts.Status = state.StatusPending
+		ts.PendingIntent = &state.Intent{
+			Action: state.IntentCreateWorktr, Branch: ts.Branch, Worktree: ts.Worktree,
+		}
+		return nil
+	})
+
+	if err := h.loop.Repair(); err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+	st, _ := h.loop.Store.Read()
+	ts := st.Tasks["alpha"]
+	if ts.PendingIntent != nil {
+		t.Fatal("the create-worktree intent survived repair")
+	}
+	if ts.Status != state.StatusQueued {
+		t.Fatalf("Status = %q, want queued; a worktree that exists was thrown away", ts.Status)
+	}
+	if _, err := os.Stat(ts.Worktree); err != nil {
+		t.Errorf("the worktree was removed: %v", err)
+	}
+}
+
+// Doctor must only promise a repair that exists. Land is not repaired by the
+// loop, so telling the captain to restart it leaves them waiting on something
+// that will never happen.
+func TestDoctorOnlyPromisesRepairsTheLoopActuallyPerforms(t *testing.T) {
+	h := newHarness(t, []map[string]any{step(0.10, implReport("done"))})
+	h.loop.Store.Update(func(st *state.State) error {
+		st.Upsert(&state.TaskState{ID: "alpha", Status: state.StatusApproved, Attempt: 1,
+			PendingIntent: &state.Intent{Action: state.IntentLand}})
+		return nil
+	})
+	problems, err := h.app.DoctorFindings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, p := range problems {
+		if !strings.Contains(p.Detail, "intent") {
+			continue
+		}
+		found = true
+		if strings.Contains(p.Detail, "repairs this on restart") {
+			t.Errorf("doctor promises a restart repairs a land intent: %q", p.Detail)
+		}
+		if !strings.Contains(p.Detail, string(state.IntentLand)) {
+			t.Errorf("Detail = %q, want it to name the intent", p.Detail)
+		}
+	}
+	if !found {
+		t.Fatal("doctor did not report the unfinished intent at all")
 	}
 }
 

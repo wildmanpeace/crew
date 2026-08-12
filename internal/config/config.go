@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -208,9 +209,89 @@ func (c *Config) Location() (*time.Location, error) {
 	return loc, nil
 }
 
+// workerFlags is the closed set of flags a worker may pass to a check
+// command, mapped to whether the flag takes a value.
+//
+// Everything here is a selector: which packages, which tests, how long they
+// get, how they are reported. Nothing here names a program to run or a file to
+// write, and that is the whole point. `go test -exec <prog>` and
+// `-toolexec <prog>` execute an arbitrary program, and `-o <path>` writes one;
+// a verifier reaching any of them would have a commit path despite having no
+// commit verb. The set is closed rather than a deny list so a flag nobody
+// thought about is absent by construction.
+var workerFlags = map[string]bool{
+	"run":      true,
+	"skip":     true,
+	"bench":    true,
+	"count":    true,
+	"timeout":  true,
+	"parallel": true,
+	"tags":     true,
+	"v":        false,
+	"race":     false,
+	"short":    false,
+	"failfast": false,
+	"cover":    false,
+	"json":     false,
+}
+
+// permittedFlags renders the allow-list for an error message.
+func permittedFlags() string {
+	names := make([]string, 0, len(workerFlags))
+	for name := range workerFlags {
+		names = append(names, "-"+name)
+	}
+	slices.Sort(names)
+	return strings.Join(names, " ")
+}
+
+// checkWorkerArgs reports the first worker-supplied argument that is not a
+// selector.
+//
+// A positional argument is a package pattern and passes. A flag passes only if
+// workerFlags names it, in either the -flag=value or the -flag value spelling,
+// with one dash or two — Go's flag parsing accepts all four, so validating one
+// spelling would validate nothing. A value that is itself flag-shaped is
+// refused rather than swallowed, because a swallowed value reaches the command
+// unexamined.
+func checkWorkerArgs(verb string, args []string) error {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		spelling, _, inline := strings.Cut(arg, "=")
+		name := strings.TrimPrefix(strings.TrimPrefix(spelling, "-"), "-")
+
+		// A bare "-" or "--" trims to nothing and is not a selector either.
+		takesValue, permitted := workerFlags[name]
+		if !permitted {
+			return fmt.Errorf(
+				"check_commands.%s: argument %q is not permitted; a worker may pass package selectors and these flags: %s",
+				verb, spelling, permittedFlags())
+		}
+		if inline || !takesValue {
+			continue
+		}
+		if i+1 >= len(args) {
+			return fmt.Errorf("check_commands.%s: flag %q needs a value", verb, spelling)
+		}
+		if next := args[i+1]; strings.HasPrefix(next, "-") {
+			return fmt.Errorf("check_commands.%s: flag %q needs a value, got the flag %q",
+				verb, spelling, next)
+		}
+		i++
+	}
+	return nil
+}
+
 // Resolve composes the argv for a configured verb. Worker-supplied arguments
 // replace the configured defaults; when the worker supplies none, the
 // defaults apply. An unconfigured verb is a hard error.
+//
+// Worker arguments are checked against the allow-list; configured defaults are
+// not, because they are the captain's own and a project that needs an exec
+// wrapper can say so in its config.
 func (c *Config) Resolve(verb string, workerArgs []string) ([]string, error) {
 	cmd, ok := c.CheckCommands[verb]
 	if !ok {
@@ -218,6 +299,9 @@ func (c *Config) Resolve(verb string, workerArgs []string) ([]string, error) {
 	}
 	argv := slices.Clone(cmd.Argv)
 	if len(workerArgs) > 0 {
+		if err := checkWorkerArgs(verb, workerArgs); err != nil {
+			return nil, err
+		}
 		return append(argv, workerArgs...), nil
 	}
 	return append(argv, cmd.DefaultArgs...), nil

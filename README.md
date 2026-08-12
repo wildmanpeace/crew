@@ -20,8 +20,10 @@ providing evidence, it is providing a claim. crew separates the two roles and
 then makes the separation structural:
 
 - **The implementer and the verifier are different processes** with different
-  binaries on their PATH. A verifier physically cannot commit, because the
-  dispatcher that exposes a `commit` verb is not reachable from its worktree.
+  binaries on their PATH. A verifier has no `commit` verb to reach, because the
+  dispatcher that exposes one is not installed anywhere it can find. That is a
+  boundary against an agent talking itself into committing, not a sandbox
+  against one setting out to — see [what the confinement is and is not](#what-the-confinement-is-and-is-not).
 - **A verifier's passing test only counts once crew has broken it.** Every
   test the verifier writes gets a negative control: crew rebuilds the branch
   with the implementation removed and confirms the test now fails. A test that
@@ -214,7 +216,7 @@ it. The suggestion is advice for a person — crew never edits `TASKS.md`.
 ## How workers are confined
 
 Each worker runs `claude -p` in its own git worktree, in its own tmux window,
-under three independent layers:
+under four independent layers:
 
 1. **Permissions.** The implementer may edit anything in its worktree; the
    verifier may edit only files matching the verify-test suffix, plus its own
@@ -230,6 +232,14 @@ under three independent layers:
    `build` — there is no commit verb to permit. Each binary hard-codes its role
    at compile time; the role is never read from the environment, because a
    worker controls its own environment.
+4. **An argument allow-list.** A worker's arguments are appended to a command
+   it does not otherwise control, and some of that command's flags name a
+   program to run: `go test -exec <prog>` and `-toolexec <prog>` both do, and
+   `-o <path>` writes a file. A worker may pass package selectors and a closed
+   set of selector flags (`-run`, `-skip`, `-bench`, `-count`, `-timeout`,
+   `-parallel`, `-tags`, `-v`, `-race`, `-short`, `-failfast`, `-cover`,
+   `-json`); anything else is refused by name, in every spelling. Your own
+   `default_args` are not filtered — they are the captain's, not a worker's.
 
 A worker's *context* is confined the same way. Auto memory is off, so nothing
 accumulates between one-shot runs, and `claudeMdExcludes` covers both the
@@ -242,6 +252,26 @@ Budgets are checked before a spawn, not discovered after. Each worker's budget
 is shrunk by a safety margin because `--max-budget-usd` is applied *after* the
 turn that breaches it — measured overshooting its cap by 3.5x — so a worker
 handed exactly the remaining headroom can still blow through the ceiling.
+
+### What the confinement is and is not
+
+The four layers are designed against an **overeager but aligned** worker: the
+realistic failure is a verifier that decides the fix is obvious and it may as
+well apply it, or an implementer that decides the branch is good enough to
+merge. Against that, the layers hold, and they hold mechanically rather than by
+asking an agent to behave.
+
+They are **not** a sandbox against a worker that sets out to break them. The
+verifier is *permitted* to author `*_crewverify_test.go` files, Go test code is
+arbitrary Go, and `crew-check test` is the command that runs it — so a test
+file can call `os.WriteFile` or `os/exec` for itself. Closing that would mean
+running checks in a real sandbox (a container, or seccomp), which crew does
+not do. The argument allow-list closes the flag vector, not that one.
+
+What still holds either way is the *land* path: nothing reaches `main` without
+a captain at a terminal typing `crew approve`, and landing re-checks the sha
+that was approved. A worker that escaped its worktree would have written to its
+own worktree, which is thrown away unless a person approves it.
 
 ## Commands
 

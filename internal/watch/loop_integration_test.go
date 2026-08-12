@@ -633,6 +633,110 @@ func TestCrashBetweenIntentAndEffectIsRepaired(t *testing.T) {
 	}
 }
 
+// A crash between recording the create-worktree intent and creating it left a
+// dangling intent Repair did not know about, while crew doctor claimed a
+// restart would clear it. Any doctor finding refuses every spawn, so this
+// wedged all future work behind a finding no restart could ever clear.
+func TestCrashBeforeTheWorktreeExistsIsCleanedUpNotWedged(t *testing.T) {
+	h := newHarness(t, []map[string]any{step(0.10, implReport("done"))})
+	branch, worktree := watch.BranchName("alpha", 1), watch.WorktreePath(h.root, "alpha", 1)
+	h.loop.Store.Update(func(st *state.State) error {
+		st.Upsert(&state.TaskState{
+			ID: "alpha", Status: state.StatusPending, Attempt: 1,
+			Branch: branch, Worktree: worktree,
+			PendingIntent: &state.Intent{
+				Action: state.IntentCreateWorktr, Branch: branch, Worktree: worktree,
+			},
+		})
+		return nil
+	})
+
+	if err := h.loop.Repair(); err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+	st, _ := h.loop.Store.Read()
+	if st.Tasks["alpha"].PendingIntent != nil {
+		t.Fatal("the create-worktree intent survived repair")
+	}
+
+	// Doctor must come back clean, or every future spawn stays refused.
+	problems, err := h.app.DoctorFindings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range problems {
+		t.Errorf("doctor still failing after repair: %s: %s", p.TaskID, p.Detail)
+	}
+	// The proof that matters: the task can be spawned again.
+	if err := h.app.Spawn("alpha", false); err != nil {
+		t.Fatalf("Spawn after repair: %v", err)
+	}
+}
+
+// The other outcome of the same crash: the worktree was created and only the
+// intent was left behind. Rolling that back would throw away a good worktree.
+func TestACompletedWorktreeIntentIsRolledForward(t *testing.T) {
+	h := newHarness(t, []map[string]any{step(0.10, implReport("done"))})
+	if err := h.app.Spawn("alpha", false); err != nil {
+		t.Fatal(err)
+	}
+	h.loop.Store.Update(func(st *state.State) error {
+		ts := st.Tasks["alpha"]
+		ts.Status = state.StatusPending
+		ts.PendingIntent = &state.Intent{
+			Action: state.IntentCreateWorktr, Branch: ts.Branch, Worktree: ts.Worktree,
+		}
+		return nil
+	})
+
+	if err := h.loop.Repair(); err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+	st, _ := h.loop.Store.Read()
+	ts := st.Tasks["alpha"]
+	if ts.PendingIntent != nil {
+		t.Fatal("the create-worktree intent survived repair")
+	}
+	if ts.Status != state.StatusQueued {
+		t.Fatalf("Status = %q, want queued; a worktree that exists was thrown away", ts.Status)
+	}
+	if _, err := os.Stat(ts.Worktree); err != nil {
+		t.Errorf("the worktree was removed: %v", err)
+	}
+}
+
+// Doctor must only promise a repair that exists. Land is not repaired by the
+// loop, so telling the captain to restart it leaves them waiting on something
+// that will never happen.
+func TestDoctorOnlyPromisesRepairsTheLoopActuallyPerforms(t *testing.T) {
+	h := newHarness(t, []map[string]any{step(0.10, implReport("done"))})
+	h.loop.Store.Update(func(st *state.State) error {
+		st.Upsert(&state.TaskState{ID: "alpha", Status: state.StatusApproved, Attempt: 1,
+			PendingIntent: &state.Intent{Action: state.IntentLand}})
+		return nil
+	})
+	problems, err := h.app.DoctorFindings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, p := range problems {
+		if !strings.Contains(p.Detail, "intent") {
+			continue
+		}
+		found = true
+		if strings.Contains(p.Detail, "repairs this on restart") {
+			t.Errorf("doctor promises a restart repairs a land intent: %q", p.Detail)
+		}
+		if !strings.Contains(p.Detail, string(state.IntentLand)) {
+			t.Errorf("Detail = %q, want it to name the intent", p.Detail)
+		}
+	}
+	if !found {
+		t.Fatal("doctor did not report the unfinished intent at all")
+	}
+}
+
 // The whole point of the loop: reaching a captain decision and landing it.
 func TestFullPathThroughApproveAndLand(t *testing.T) {
 	h := newHarness(t, []map[string]any{

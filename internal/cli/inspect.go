@@ -293,8 +293,15 @@ func (a *App) DoctorFindings() ([]Problem, error) {
 			problems = append(problems, Problem{id, "has state but is not declared in TASKS.md"})
 		}
 		if ts.PendingIntent != nil {
+			// Only promise a repair the loop actually performs. Any finding
+			// here refuses every spawn, so naming the wrong remedy leaves the
+			// captain waiting on a restart that will not clear it.
+			advice := "crew watch repairs this on restart"
+			if ts.PendingIntent.Action == state.IntentLand {
+				advice = "re-run crew land once the cause is resolved"
+			}
 			problems = append(problems, Problem{id,
-				fmt.Sprintf("unfinished %s intent; crew watch repairs this on restart", ts.PendingIntent.Action)})
+				fmt.Sprintf("unfinished %s intent; %s", ts.PendingIntent.Action, advice)})
 		}
 		if ts.Window != "" && isActiveStatus(ts.Status) {
 			alive, _ := tmux.WindowExists(a.Session, ts.Window)

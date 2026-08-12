@@ -155,28 +155,72 @@ func (l *Loop) Repair() error {
 		return err
 	}
 	for _, ts := range st.PendingIntents() {
-		intent := ts.PendingIntent
-		if intent.Action != state.IntentSpawnWindow {
-			continue
-		}
-		windowLive, _ := tmux.WindowExists(l.Session, intent.Window)
-		_, runDone, _ := worker.ReadExit(l.runsDir(), intent.RunID)
-
-		switch {
-		case runDone:
-			// The effect completed; the normal completion path will pick it up.
-			l.clearIntent(ts.ID, "")
-		case windowLive:
-			// The effect happened and is still going.
-			l.clearIntent(ts.ID, state.StatusRunning)
-		default:
-			// The effect never happened.
-			l.clearIntent(ts.ID, state.StatusQueued)
-			l.record(state.Event{TaskID: ts.ID, Kind: "repaired",
-				Detail: fmt.Sprintf("spawn intent for run %s never took effect; returned to queued", intent.RunID)})
+		switch ts.PendingIntent.Action {
+		case state.IntentSpawnWindow:
+			l.repairSpawnWindow(ts)
+		case state.IntentCreateWorktr:
+			l.repairCreateWorktree(ts)
 		}
 	}
 	return nil
+}
+
+func (l *Loop) repairSpawnWindow(ts *state.TaskState) {
+	intent := ts.PendingIntent
+	windowLive, _ := tmux.WindowExists(l.Session, intent.Window)
+	_, runDone, _ := worker.ReadExit(l.runsDir(), intent.RunID)
+
+	switch {
+	case runDone:
+		// The effect completed; the normal completion path will pick it up.
+		l.clearIntent(ts.ID, "")
+	case windowLive:
+		// The effect happened and is still going.
+		l.clearIntent(ts.ID, state.StatusRunning)
+	default:
+		// The effect never happened.
+		l.clearIntent(ts.ID, state.StatusQueued)
+		l.record(state.Event{TaskID: ts.ID, Kind: "repaired",
+			Detail: fmt.Sprintf("spawn intent for run %s never took effect; returned to queued", intent.RunID)})
+	}
+}
+
+// repairCreateWorktree reconciles a crew spawn that crashed between recording
+// its intent and creating the branch and worktree.
+//
+// Leaving this unhandled was worse than leaving one task stranded: crew doctor
+// reports any unfinished intent, and any doctor finding refuses every spawn,
+// so a crash in that window wedged all future work behind a finding no restart
+// could clear — while doctor told the captain a restart was the fix.
+func (l *Loop) repairCreateWorktree(ts *state.TaskState) {
+	intent := ts.PendingIntent
+	branchLive, _ := l.Repo.BranchExists(intent.Branch)
+	_, statErr := os.Stat(intent.Worktree)
+
+	if branchLive && statErr == nil {
+		// The effect completed; only the record of it was lost.
+		l.clearIntent(ts.ID, state.StatusQueued)
+		l.record(state.Event{TaskID: ts.ID, Kind: "repaired",
+			Detail: fmt.Sprintf("worktree intent for %s had completed; queued", intent.Branch)})
+		return
+	}
+
+	// A half-made attempt is rolled back rather than forward: crew spawn
+	// refuses a branch or worktree that already exists, so anything left
+	// behind would refuse the task for good.
+	if statErr == nil {
+		if err := l.Repo.RemoveWorktree(intent.Worktree); err != nil {
+			os.RemoveAll(intent.Worktree)
+		}
+	}
+	l.Repo.PruneWorktrees()
+	if branchLive {
+		l.Repo.DeleteBranch(intent.Branch, true)
+	}
+	l.clearIntent(ts.ID, state.StatusPending)
+	l.record(state.Event{TaskID: ts.ID, Kind: "repaired",
+		Detail: fmt.Sprintf("worktree intent for %s never completed; cleaned up, crew spawn can run again",
+			intent.Branch)})
 }
 
 func (l *Loop) clearIntent(taskID string, newStatus state.Status) {

@@ -227,3 +227,39 @@ func TestSettingsMergeKeepsExistingKeysAndAddsTheDenyRule(t *testing.T) {
 		t.Errorf("the deny rule appears %d times, want 1", n)
 	}
 }
+
+// An existing settings.json whose shape crew doesn't expect must fail loudly
+// rather than have the unexpected value silently discarded and overwritten —
+// that would contradict the promise that init on an established project
+// cannot lose your own configuration.
+func TestSettingsMergeErrorsOnUnexpectedPermissionsShape(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, ".claude/settings.json", `{"permissions":"not-an-object"}`)
+
+	_, err := Write(dir, mustProfile(t, Go), false)
+	if err == nil {
+		t.Fatal("Write succeeded despite permissions being a string, not an object")
+	}
+	if !strings.Contains(err.Error(), "permissions") {
+		t.Errorf("error = %v, want it to name the offending key %q", err, "permissions")
+	}
+	if got := read(t, dir, ".claude/settings.json"); got != `{"permissions":"not-an-object"}` {
+		t.Errorf("settings.json was modified despite the error: %q", got)
+	}
+}
+
+func TestSettingsMergeErrorsOnUnexpectedDenyShape(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, ".claude/settings.json", `{"permissions":{"deny":"not-an-array"}}`)
+
+	_, err := Write(dir, mustProfile(t, Go), false)
+	if err == nil {
+		t.Fatal("Write succeeded despite deny being a string, not an array")
+	}
+	if !strings.Contains(err.Error(), "deny") {
+		t.Errorf("error = %v, want it to name the offending key %q", err, "deny")
+	}
+	if got := read(t, dir, ".claude/settings.json"); got != `{"permissions":{"deny":"not-an-array"}}` {
+		t.Errorf("settings.json was modified despite the error: %q", got)
+	}
+}

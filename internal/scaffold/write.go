@@ -227,11 +227,17 @@ func mergeSettings(root string) (bool, error) {
 		return false, err
 	}
 
-	perms, _ := doc["permissions"].(map[string]any)
-	if perms == nil {
-		perms = map[string]any{}
+	perms := map[string]any{}
+	if raw, ok := doc["permissions"]; ok {
+		perms, ok = raw.(map[string]any)
+		if !ok {
+			return false, fmt.Errorf("%s: %q is %T, want an object", path, "permissions", raw)
+		}
 	}
-	deny := toStrings(perms["deny"])
+	deny, err := toStrings(perms["deny"])
+	if err != nil {
+		return false, fmt.Errorf("%s: %q is %w", path, "deny", err)
+	}
 	if slices.Contains(deny, ApproveDenyRule) {
 		return false, nil
 	}
@@ -248,16 +254,26 @@ func mergeSettings(root string) (bool, error) {
 	return true, os.WriteFile(path, append(body, '\n'), 0o644)
 }
 
-func toStrings(v any) []string {
+// toStrings converts a JSON array field to a string slice. A missing field
+// (nil) is not an error — the caller simply has none yet — but a present
+// field that isn't an array of strings is a shape crew doesn't understand,
+// and coercing it to nil would silently discard whatever the project had
+// there.
+func toStrings(v any) ([]string, error) {
+	if v == nil {
+		return nil, nil
+	}
 	items, ok := v.([]any)
 	if !ok {
-		return nil
+		return nil, fmt.Errorf("%T, want an array", v)
 	}
 	var out []string
 	for _, it := range items {
-		if s, ok := it.(string); ok {
-			out = append(out, s)
+		s, ok := it.(string)
+		if !ok {
+			return nil, fmt.Errorf("contains a %T, want a string", it)
 		}
+		out = append(out, s)
 	}
-	return out
+	return out, nil
 }

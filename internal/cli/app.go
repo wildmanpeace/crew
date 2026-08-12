@@ -33,6 +33,13 @@ type App struct {
 	Now   func() time.Time
 	IsTTY func() bool
 
+	// Notify, when set, delivers this App's events the way crew watch delivers
+	// its own. It stays nil for commands the captain runs themselves, whose
+	// output they are already reading. crew watch sets it, because once the
+	// loop lands a task the captain is no longer watching a command run, and a
+	// land that conflicted would otherwise be silent.
+	Notify func(state.Event)
+
 	// Session is the tmux session worker windows live in.
 	Session string
 }
@@ -104,4 +111,7 @@ func (a *App) emit(ev state.Event) {
 		ev.At = a.now()
 	}
 	a.Store.Append(ev)
+	if a.Notify != nil {
+		a.Notify(ev)
+	}
 }

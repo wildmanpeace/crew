@@ -251,10 +251,15 @@ func newLoop(app *cli.App) (*watch.Loop, error) {
 	if err != nil {
 		return nil, fmt.Errorf("claude is not on PATH: %w", err)
 	}
+	notify := func(ev state.Event) { cli.Notify("crew: "+ev.Kind, ev.TaskID+" "+ev.Detail) }
+	// The loop lands through the same App the captain would, so auto-landing
+	// and a manual crew land cannot drift apart in what they check.
+	app.Notify = notify
 	return &watch.Loop{
 		Root: app.Root, Cfg: app.Cfg, Store: app.Store, Repo: app.Repo,
 		CrewBin: self, ClaudeBin: claudeBin, Session: app.Session, Loc: app.Loc,
-		Notify: func(ev state.Event) { cli.Notify("crew: "+ev.Kind, ev.TaskID+" "+ev.Detail) },
+		Notify: notify,
+		Land:   app.Land,
 	}, nil
 }
 

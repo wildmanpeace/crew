@@ -134,6 +134,7 @@ func newHarness(t *testing.T, script []map[string]any) *harness {
 		CrewBin:   filepath.Join(bins, "crew"),
 		ClaudeBin: filepath.Join(bins, "fakeclaude"),
 		Session:   session, Loc: loc,
+		Land: app.Land,
 	}
 	h := &harness{root: root, app: app, loop: loop, session: session, t: t}
 	if err := app.InstallDispatchersFrom(bins); err != nil {
@@ -191,6 +192,18 @@ func (h *harness) settle(taskID string, want ...state.Status) *state.TaskState {
 	st, _ := h.loop.Store.Read()
 	h.t.Fatalf("task %q never reached %v; last state: %+v", taskID, want, st.Tasks[taskID])
 	return nil
+}
+
+// commitInWorktree gives a task a real commit to land. Nothing the fake worker
+// does touches the tree, so without this there is no diff to approve.
+func (h *harness) commitInWorktree(taskID, body string) {
+	h.t.Helper()
+	wt := watch.WorktreePath(h.root, taskID, 1)
+	writeFile(h.t, filepath.Join(wt, "ratelimit", "bucket.go"),
+		"package ratelimit\n\n"+body+"\n")
+	wtRepo := gitx.New(wt)
+	mustGit(h.t, wtRepo, "add", "-A")
+	mustGit(h.t, wtRepo, "commit", "-qm", "implement")
 }
 
 func (h *harness) start(taskID string) {
@@ -420,13 +433,8 @@ func TestFullPathThroughApproveAndLand(t *testing.T) {
 	h.start("alpha")
 
 	// The implementer must actually commit something for there to be a diff.
-	wt := watch.WorktreePath(h.root, "alpha", 1)
 	h.settle("alpha", state.StatusReadyForReview)
-	writeFile(t, filepath.Join(wt, "ratelimit", "bucket.go"),
-		"package ratelimit\n\nfunc Allow() bool { return false }\n")
-	wtRepo := gitx.New(wt)
-	mustGit(t, wtRepo, "add", "-A")
-	mustGit(t, wtRepo, "commit", "-qm", "implement")
+	h.commitInWorktree("alpha", "func Allow() bool { return false }")
 
 	head, _ := h.app.Repo.RevParse(watch.BranchName("alpha", 1))
 	if err := h.app.Approve("alpha", head); err != nil {
@@ -575,5 +583,59 @@ func (h *harness) rewindRunStart(taskID string, by time.Duration) {
 		return nil
 	}); err != nil {
 		h.t.Fatal(err)
+	}
+}
+
+// Approval is the captain's decision. The merge that follows re-checks the
+// approved sha and decides nothing, so the loop carries an approved task the
+// rest of the way rather than making the captain enact a call already made.
+func TestLoopLandsAnApprovedTask(t *testing.T) {
+	h := newHarness(t, []map[string]any{
+		step(0.10, implReport("done")),
+		step(0.05, verifierReport("satisfied", true)),
+	})
+	h.start("alpha")
+	h.settle("alpha", state.StatusReadyForReview)
+	h.commitInWorktree("alpha", "func Allow() bool { return false }")
+
+	head, _ := h.app.Repo.RevParse(watch.BranchName("alpha", 1))
+	if err := h.app.Approve("alpha", head); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+
+	// Deliberately no Land call: the loop is what must carry it.
+	h.settle("alpha", state.StatusLanded)
+
+	body, err := os.ReadFile(filepath.Join(h.root, "ratelimit", "bucket.go"))
+	if err != nil || !strings.Contains(string(body), "return false") {
+		t.Fatalf("the change did not land on main: %v %s", err, body)
+	}
+}
+
+// A dirty main is the captain's own work in progress, not a fault in the task.
+// Landing waits for it rather than failing the task or merging over them.
+func TestLoopWaitsRatherThanFailingWhenMainIsDirty(t *testing.T) {
+	h := newHarness(t, []map[string]any{
+		step(0.10, implReport("done")),
+		step(0.05, verifierReport("satisfied", true)),
+	})
+	h.start("alpha")
+	h.settle("alpha", state.StatusReadyForReview)
+	h.commitInWorktree("alpha", "func Allow() bool { return false }")
+
+	head, _ := h.app.Repo.RevParse(watch.BranchName("alpha", 1))
+	if err := h.app.Approve("alpha", head); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	writeFile(t, filepath.Join(h.root, "ratelimit", "scratch.go"), "package ratelimit\n")
+
+	for range 3 {
+		if err := h.loop.Tick(t.Context()); err != nil {
+			t.Fatalf("Tick: %v", err)
+		}
+	}
+	st, _ := h.loop.Store.Read()
+	if got := st.Tasks["alpha"].Status; got != state.StatusApproved {
+		t.Fatalf("Status = %q, want approved: a dirty main must not fail the task", got)
 	}
 }

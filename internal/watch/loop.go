@@ -41,6 +41,18 @@ type Loop struct {
 	// Notify delivers captain-facing events. Internal transitions such as
 	// verify_failed are recorded but never notified.
 	Notify func(state.Event)
+
+	// Land merges an approved task, normally cli.App.Land. It is injected
+	// rather than reimplemented so the loop and a manual crew land share one
+	// set of checks: the approved sha, a clean main, and a scratch merge.
+	// A nil Land leaves approved tasks for the captain to land themselves.
+	Land func(taskID string) error
+
+	// landDeferred remembers which tasks have already reported a land that
+	// could not proceed, so a main left dirty for an hour notifies once rather
+	// than every poll. It is per-process on purpose: a restart is a fine
+	// moment to be told again.
+	landDeferred map[string]bool
 }
 
 func (l *Loop) now() time.Time {
@@ -228,10 +240,68 @@ func (l *Loop) Tick(ctx context.Context) error {
 		}
 	}
 
+	if err := l.landApproved(ctx); err != nil {
+		l.record(state.Event{Kind: "watch_error", Detail: err.Error()})
+	}
+
 	// Start the first implementer for anything queued. crew spawn prepares the
 	// branch and worktree and stops; every worker is started here, so there is
 	// exactly one place that spawns.
 	return l.startQueued(ctx)
+}
+
+// landApproved carries approved tasks the rest of the way.
+//
+// Approval is where the captain decides; landing re-checks the approved sha
+// and merges, deciding nothing. Leaving it to be typed made the captain enact
+// a call they had already made, and a task sit approved-but-unlanded in the
+// meantime, blocking its dependents for no reason.
+func (l *Loop) landApproved(ctx context.Context) error {
+	if l.Land == nil || !l.Cfg.AutoLandEnabled() {
+		return nil
+	}
+	st, err := l.Store.Read()
+	if err != nil {
+		return err
+	}
+	var approved []string
+	for id, ts := range st.Tasks {
+		if ts.Status == state.StatusApproved {
+			approved = append(approved, id)
+		}
+	}
+	sort.Strings(approved)
+
+	for _, id := range approved {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		if err := l.Land(id); err != nil {
+			l.deferLand(id, err)
+			continue
+		}
+		delete(l.landDeferred, id)
+	}
+	return nil
+}
+
+// deferLand reports a land that could not proceed, once per task per process.
+//
+// The common cause is uncommitted work on main, which is the captain's own
+// doing and resolves on its own; the task stays approved and the next poll
+// tries again. A cause that does not resolve — a conflict — has already moved
+// the task out of approved by the time this is reached, so it is not retried.
+func (l *Loop) deferLand(taskID string, cause error) {
+	if l.landDeferred[taskID] {
+		return
+	}
+	if l.landDeferred == nil {
+		l.landDeferred = map[string]bool{}
+	}
+	l.landDeferred[taskID] = true
+	l.emit(state.Event{TaskID: taskID, Kind: "land_deferred", Detail: cause.Error()})
 }
 
 // startQueued spawns the first implementer of each queued task, subject to the

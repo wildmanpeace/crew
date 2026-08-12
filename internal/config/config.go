@@ -71,6 +71,13 @@ type Config struct {
 	BudgetTimezone string `json:"budget_timezone"`
 	MainBranch     string `json:"main_branch"`
 
+	// AutoLand lets crew watch land a task the captain has approved. Approval
+	// is the decision; the merge that follows re-checks the approved sha and
+	// decides nothing, so making the captain type it is ceremony rather than a
+	// gate. A pointer because false is a bool's zero value and an omitted key
+	// has to mean on: use AutoLandEnabled rather than reading it directly.
+	AutoLand *bool `json:"auto_land"`
+
 	// VerifyTestSuffix identifies verifier-authored tests. They live beside
 	// the code they exercise: Go ignores directories beginning with "." or
 	// "_", so the spec's .crew-verify/ would never be compiled or run.
@@ -91,6 +98,10 @@ type Config struct {
 	// cannot tell them apart.
 	NegativeControlBuildFailureMarkers []string `json:"negative_control_build_failure_markers"`
 }
+
+// AutoLandEnabled reports whether crew watch should land approved tasks. A nil
+// AutoLand means the key was omitted, which is on.
+func (c *Config) AutoLandEnabled() bool { return c.AutoLand == nil || *c.AutoLand }
 
 // Path returns the config file location for a project root.
 func Path(projectRoot string) string {

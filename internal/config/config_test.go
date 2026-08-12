@@ -190,3 +190,32 @@ func TestVerifierCannotReachCommitOrDiff(t *testing.T) {
 		}
 	}
 }
+
+// Landing is bookkeeping once the captain has approved, so it runs by default.
+// A bool cannot express "unset" by its zero value, hence the pointer: an
+// omitted key must mean on, while an explicit false must stay off.
+func TestAutoLandDefaultsOnAndHonoursAnExplicitFalse(t *testing.T) {
+	c, err := Load(writeCfg(t, minimalCfg))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.AutoLandEnabled() {
+		t.Error("AutoLandEnabled() = false for an omitted key, want true")
+	}
+
+	off, err := Load(writeCfg(t, `{"auto_land": false, "check_commands": {
+	  "test": {"argv": ["go", "test"]}, "build": {"argv": ["go", "build"]}, "lint": {"argv": ["go", "vet"]}}}`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if off.AutoLandEnabled() {
+		t.Error("AutoLandEnabled() = true for an explicit false")
+	}
+}
+
+// A Config built in code, rather than loaded, must not panic on the pointer.
+func TestAutoLandEnabledOnAZeroConfig(t *testing.T) {
+	if !(&Config{}).AutoLandEnabled() {
+		t.Error("a zero Config must default to landing, not panic or refuse")
+	}
+}

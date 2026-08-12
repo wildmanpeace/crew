@@ -364,7 +364,8 @@ func (l *Loop) runNegativeControls(taskID string, r *report.Verifier) error {
 			if c.TestFile == "" {
 				continue
 			}
-			if err := l.controlFor(taskID, branch, c, c.TestFile, scopeArgs(c.TestFile), false); err != nil {
+			if err := l.controlFor(taskID, branch, worktree, c, c.TestFile,
+				scopeArgs(c.TestFile), false); err != nil {
 				return err
 			}
 
@@ -374,7 +375,8 @@ func (l *Loop) runNegativeControls(taskID string, r *report.Verifier) error {
 			case AuthorBranch:
 				// Run exactly the check the verifier ran, against a tree with
 				// the implementation removed.
-				if err := l.controlFor(taskID, branch, c, target.File, target.RunArgs, true); err != nil {
+				if err := l.controlFor(taskID, branch, worktree, c, target.File,
+					target.RunArgs, true); err != nil {
 					return err
 				}
 			case AuthorUnknown:
@@ -388,7 +390,11 @@ func (l *Loop) runNegativeControls(taskID string, r *report.Verifier) error {
 }
 
 // controlFor runs one negative control and applies its finding.
-func (l *Loop) controlFor(taskID, branch string, c *report.CriterionResult,
+//
+// The task worktree is passed through because a verifier-authored test lives
+// only there: it is never committed, so the control has to be given the file
+// rather than expecting to find it on the branch.
+func (l *Loop) controlFor(taskID, branch, worktree string, c *report.CriterionResult,
 	testFile string, testArgs []string, selfAuthored bool) error {
 
 	argv, err := l.Cfg.Resolve("test", testArgs)
@@ -399,6 +405,7 @@ func (l *Loop) controlFor(taskID, branch string, c *report.CriterionResult,
 		Repo:                l.Repo,
 		MainBranch:          l.Cfg.MainBranch,
 		Branch:              branch,
+		SourceWorktree:      worktree,
 		TestFile:            testFile,
 		TestArgv:            argv,
 		BuildFailureMarkers: l.Cfg.NegativeControlBuildFailureMarkers,

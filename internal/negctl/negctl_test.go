@@ -116,7 +116,13 @@ func TestLimiterAllow(t *testing.T) {
 
 // repo builds a project with a merge-base commit and a feature branch that
 // both modifies existing API and adds new API.
-func repo(t *testing.T, extraTests map[string]string) (gitx.Repo, string) {
+//
+// The verifier's tests are written into the worktree *after* the commit and
+// left uncommitted, which is the only state they can be in during a real run:
+// crew-check has no commit verb and the hook denies raw git, so a verifier
+// physically cannot put its test on the branch. Committing them here made
+// every control measure a tree that production never produces.
+func repo(t *testing.T, verifyTests map[string]string) (gitx.Repo, string) {
 	t.Helper()
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -131,11 +137,12 @@ func repo(t *testing.T, extraTests map[string]string) (gitx.Repo, string) {
 	mustGit(t, root, "checkout", "-q", "-b", "crew/alpha/attempt-1")
 	write(t, filepath.Join(root, "counter", "counter.go"), counterModified)
 	write(t, filepath.Join(root, "counter", "limiter.go"), limiterAdded)
-	for p, body := range extraTests {
-		write(t, filepath.Join(root, p), body)
-	}
 	mustGit(t, root, "add", "-A")
 	mustGit(t, root, "commit", "-qm", "feature")
+
+	for p, body := range verifyTests {
+		write(t, filepath.Join(root, p), body)
+	}
 	return gitx.New(root), root
 }
 
@@ -144,6 +151,7 @@ func params(r gitx.Repo, root, testFile string) Params {
 		Repo:                r,
 		MainBranch:          "main",
 		Branch:              "crew/alpha/attempt-1",
+		SourceWorktree:      root,
 		TestFile:            testFile,
 		TestArgv:            []string{"go", "test", "./counter/..."},
 		BuildFailureMarkers: markers,
@@ -234,10 +242,82 @@ func TestTheVerifierTestIsPreserved(t *testing.T) {
 			t.Fatal("the verifier's test was deleted by the revert")
 		}
 	}
+	if !strings.Contains(got.MergeBaseOutput, "TestAddCapsAtTen") {
+		t.Fatalf("the verifier's test did not run after the revert:\n%s", got.MergeBaseOutput)
+	}
 }
 
-// Other criteria's verifier tests are removed, so an unrelated one cannot
-// contaminate this criterion's result.
+// The flagship guarantee: a test that exists only in the task worktree must be
+// present in BOTH phases. Building the scratch worktree from the committed
+// branch head and stopping there ran the control without the verifier's test
+// at all, so it measured whatever tests the implementer had committed.
+func TestTheVerifierTestIsRunEvenThoughItIsUncommitted(t *testing.T) {
+	file := "counter/cap_crewverify_test.go"
+	r, root := repo(t, map[string]string{file: capTest})
+
+	// Nothing on the branch knows about this file; it exists only in the tree.
+	changes, err := r.ChangedFiles("main", "crew/alpha/attempt-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Path == file {
+			t.Fatalf("fixture is wrong: %s is committed, which production cannot produce", file)
+		}
+	}
+
+	got, err := Run(params(r, root, file))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(got.HeadOutput, "ok") {
+		t.Errorf("phase one did not run the package:\n%s", got.HeadOutput)
+	}
+	if got.Classification != Discriminating {
+		t.Fatalf("Classification = %q, want %q; the verifier's test was not in the control\n"+
+			"head output:\n%s\nmerge-base output:\n%s",
+			got.Classification, Discriminating, got.HeadOutput, got.MergeBaseOutput)
+	}
+	if !strings.Contains(got.MergeBaseOutput, "11th Add returned nil") {
+		t.Errorf("the control did not evaluate the verifier's assertion:\n%s", got.MergeBaseOutput)
+	}
+}
+
+// A test crew can find in neither place is reported, not silently run without.
+// Swallowing it would make the control measure the implementer's own tests.
+func TestAMissingVerifierTestIsAnError(t *testing.T) {
+	r, root := repo(t, nil)
+	_, err := Run(params(r, root, "counter/absent_crewverify_test.go"))
+	if err == nil {
+		t.Fatal("Run succeeded with no test to control")
+	}
+	if !strings.Contains(err.Error(), "absent_crewverify_test.go") {
+		t.Errorf("error = %v, want it to name the missing test", err)
+	}
+}
+
+// An implementer-authored test is already on the branch, so the checkout
+// supplies it and no source worktree is needed.
+func TestACommittedTestNeedsNoSourceWorktree(t *testing.T) {
+	file := "counter/cap_test.go"
+	r, root := repo(t, nil)
+	write(t, filepath.Join(root, file), capTest)
+	mustGit(t, root, "add", "-A")
+	mustGit(t, root, "commit", "-qm", "self-authored test")
+
+	p := params(r, root, file)
+	p.SourceWorktree = ""
+	got, err := Run(p)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got.Classification != Discriminating {
+		t.Fatalf("Classification = %q, want %q\n%s", got.Classification, Discriminating, got.MergeBaseOutput)
+	}
+}
+
+// Only the criterion's own verifier test is placed in the scratch worktree, so
+// an unrelated one cannot contaminate this criterion's result.
 func TestOtherVerifierTestsAreRemoved(t *testing.T) {
 	file := "counter/cap_crewverify_test.go"
 	other := "counter/limiter_crewverify_test.go"
@@ -342,6 +422,9 @@ func TestBranchIsUnmodified(t *testing.T) {
 	file := "counter/cap_crewverify_test.go"
 	r, root := repo(t, map[string]string{file: capTest})
 	before, _ := r.RevParse("crew/alpha/attempt-1")
+	// The verifier's uncommitted test is the tree's only expected difference,
+	// so the status is compared rather than required to be empty.
+	statusBefore, _ := exec.Command("git", "-C", root, "status", "--porcelain").Output()
 	if _, err := Run(params(r, root, file)); err != nil {
 		t.Fatal(err)
 	}
@@ -349,9 +432,9 @@ func TestBranchIsUnmodified(t *testing.T) {
 	if before != after {
 		t.Fatal("the negative control moved the branch")
 	}
-	clean, _ := r.IsClean()
-	if !clean {
-		out, _ := exec.Command("git", "-C", root, "status", "--porcelain").Output()
-		t.Fatalf("the negative control dirtied the working tree:\n%s", out)
+	statusAfter, _ := exec.Command("git", "-C", root, "status", "--porcelain").Output()
+	if string(statusBefore) != string(statusAfter) {
+		t.Fatalf("the negative control changed the working tree:\nbefore:\n%s\nafter:\n%s",
+			statusBefore, statusAfter)
 	}
 }

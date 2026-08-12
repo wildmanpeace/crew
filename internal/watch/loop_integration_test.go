@@ -249,6 +249,178 @@ func step(cost float64, report map[string]any) map[string]any {
 	return s
 }
 
+// The implementer's work: a change to pre-existing API, so a test written
+// against it compiles at the merge base as well as at head.
+const e2eImplementation = "package ratelimit\n\nfunc Allow() bool { return false }\n"
+
+// The verifier's test. It is deliberately never committed: crew-check has no
+// commit verb and the hook denies raw git, so this is the only state a
+// verifier-authored test can be in when the control runs.
+const e2eVerifyTest = `package ratelimit
+
+import "testing"
+
+func TestAllowRefusesWhenEmpty(t *testing.T) {
+	if Allow() {
+		t.Fatal("Allow returned true with an empty bucket")
+	}
+}
+`
+
+const e2eVerifyTestFile = "ratelimit/empty_crewverify_test.go"
+
+// implStep is an implementer that actually writes and commits its work.
+func implStep(cost float64) map[string]any {
+	s := step(cost, implReport("done"))
+	s["files"] = map[string]string{"ratelimit/bucket.go": e2eImplementation}
+	s["commit"] = true
+	return s
+}
+
+// negControlStep is a verifier that writes a real test and claims a
+// negative-control criterion against it. The claim is provisional; crew's own
+// control is what decides.
+func negControlStep(cost float64) map[string]any {
+	s := step(cost, map[string]any{
+		"task_id": "alpha", "role": "verifier", "status": "satisfied",
+		"criteria_results": []map[string]any{{
+			"description": "Allow refuses when the bucket is empty.",
+			"evaluation":  "negative_control_test",
+			"test_file":   e2eVerifyTestFile,
+			"met":         true,
+			"notes":       "wrote a test that fails without the change",
+		}},
+		"finished_at": time.Now().UTC().Format(time.RFC3339),
+	})
+	s["files"] = map[string]string{e2eVerifyTestFile: e2eVerifyTest}
+	return s
+}
+
+// events returns everything crew has recorded, in order.
+func (h *harness) events() []state.Event {
+	h.t.Helper()
+	raw, err := os.ReadFile(filepath.Join(h.root, ".crew", "events.jsonl"))
+	if err != nil {
+		h.t.Fatalf("read events: %v", err)
+	}
+	var out []state.Event
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var ev state.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			h.t.Fatalf("parse event %q: %v", line, err)
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+func (h *harness) eventsOfKind(kind string) []state.Event {
+	h.t.Helper()
+	var out []state.Event
+	for _, ev := range h.events() {
+		if ev.Kind == kind {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// The flagship guarantee, driven end to end: a verifier-authored negative
+// control must be measured against the verifier's own test.
+//
+// The verifier writes its test into the task worktree and cannot commit it, so
+// before this the scratch worktree — built from the committed branch head —
+// never contained it. Both phases ran the implementer's committed tests
+// instead, of which there are none here, so the control concluded
+// "passes_at_merge_base" about a test it had never executed and the criterion
+// failed unfixably. Nothing in the suite exercised this shape, which is why it
+// shipped green.
+func TestVerifierAuthoredNegativeControlIsMeasuredAgainstTheVerifiersOwnTest(t *testing.T) {
+	h := newHarness(t, []map[string]any{
+		implStep(0.10),
+		negControlStep(0.05),
+	})
+	h.start("alpha")
+	ts := h.settle("alpha", state.StatusReadyForReview, state.StatusNeedsReframe,
+		state.StatusBlocked, state.StatusFailed)
+
+	controls := h.eventsOfKind("negative_control")
+	if len(controls) != 1 {
+		t.Fatalf("recorded %d negative controls, want exactly 1: %+v", len(controls), controls)
+	}
+	payload, ok := controls[0].Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("negative control payload = %T", controls[0].Payload)
+	}
+	if got := payload["classification"]; got != "discriminating" {
+		t.Errorf("classification = %v, want discriminating; the verifier's test was not in the control\n"+
+			"merge-base output:\n%v", got, payload["merge_base_output"])
+	}
+	if got := payload["test_file"]; got != e2eVerifyTestFile {
+		t.Errorf("test_file = %v, want %s", got, e2eVerifyTestFile)
+	}
+	// The proof the verifier's assertion actually ran: its failure text can
+	// only appear if the file was present in the reverted tree.
+	if out, _ := payload["merge_base_output"].(string); !strings.Contains(out, "Allow returned true") {
+		t.Errorf("the verifier's assertion never ran in the control:\n%s", out)
+	}
+
+	if ts.Status != state.StatusReadyForReview {
+		t.Fatalf("Status = %q, want ready_for_review: %s", ts.Status, ts.Notes)
+	}
+	ready := h.eventsOfKind("ready_for_review")
+	if len(ready) == 0 {
+		t.Fatal("no ready_for_review event")
+	}
+	if got := ready[len(ready)-1].Ratio; got != "1 mechanical / 0 judged" {
+		t.Errorf("ratio = %q, want %q", got, "1 mechanical / 0 judged")
+	}
+	if ts.Cycle != 1 {
+		t.Errorf("Cycle = %d, want 1; the control sent real work back", ts.Cycle)
+	}
+}
+
+// The other half of the guarantee: a verifier test that passes with the
+// implementation taken away must be caught. It is the same path as the test
+// above, so a copy-in that happened to leave the file out of the revert would
+// pass one and fail the other.
+func TestAVacuousVerifierTestIsCaughtByTheControl(t *testing.T) {
+	vacuous := negControlStep(0.05)
+	vacuous["files"] = map[string]string{e2eVerifyTestFile: `package ratelimit
+
+import "testing"
+
+func TestAllowIsCallable(t *testing.T) {
+	_ = Allow()
+}
+`}
+	h := newHarness(t, []map[string]any{
+		implStep(0.10),
+		vacuous,
+		implStep(0.10),
+		negControlStep(0.05),
+	})
+	h.start("alpha")
+	ts := h.settle("alpha", state.StatusReadyForReview, state.StatusNeedsReframe)
+
+	controls := h.eventsOfKind("negative_control")
+	if len(controls) == 0 {
+		t.Fatal("no negative control ran")
+	}
+	first, _ := controls[0].Payload.(map[string]any)
+	if got := first["classification"]; got != "passes_at_merge_base" {
+		t.Fatalf("classification = %v, want passes_at_merge_base", got)
+	}
+	// A vacuous test is a verify failure, so the task must have gone back for
+	// another cycle rather than passing on the verifier's own say-so.
+	if ts.Cycle != 2 {
+		t.Fatalf("Cycle = %d, want 2; a test that cannot fail was accepted as evidence", ts.Cycle)
+	}
+}
+
 // The happy path, end to end through real tmux windows.
 func TestLoopReachesReadyForReview(t *testing.T) {
 	h := newHarness(t, []map[string]any{

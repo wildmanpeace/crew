@@ -52,6 +52,18 @@ type Params struct {
 	// TestFile is the verifier-authored test, relative to the worktree root.
 	TestFile string
 
+	// SourceWorktree is the task worktree the test was authored in.
+	//
+	// A verifier-authored test never reaches the branch: crew-check exposes no
+	// commit verb and the hook denies raw git, so the file exists only in the
+	// working tree. The scratch worktree is built from the committed branch
+	// head, so without copying it in, both phases run without the very test
+	// the control exists to evaluate and the control silently measures the
+	// implementer's own committed tests instead.
+	//
+	// It may be empty for a test the branch already carries.
+	SourceWorktree string
+
 	// TestArgv is the project's configured test command, already scoped to
 	// the package under test.
 	TestArgv []string
@@ -109,6 +121,11 @@ func Run(p Params) (Result, error) {
 		p.Repo.PruneWorktrees()
 	}()
 
+	// The test under control has to be present before either phase runs.
+	if err := placeTest(p, wt); err != nil {
+		return res, err
+	}
+
 	// Phase one: the test must pass with the implementation present.
 	headCode, headOut := runTest(wt, p.TestArgv)
 	res.HeadOutput = headOut
@@ -145,6 +162,55 @@ func Run(p Params) (Result, error) {
 		res.Reason = "the test fails without the implementation and passes with it"
 	}
 	return res, nil
+}
+
+// placeTest puts the test under control into the scratch worktree.
+//
+// A verifier-authored test is not on the branch and cannot be: the verifier's
+// tool surface has no commit verb and the hook denies raw git, so the file
+// lives only in the task worktree. Copying it in is what makes the control
+// measure the verifier's test rather than whatever the implementer committed.
+// It is copied rather than committed to the branch on purpose — a verifier
+// test that reached the branch would land with the work, would show up in the
+// diff the next cycle's verifier reads, and would survive the between-cycle
+// cleanup that keeps it away from the next implementer.
+//
+// The copy is untracked in the scratch worktree, so the revert leaves it in
+// place: it is not among the files that changed between merge-base and head.
+//
+// A test that is neither on the branch nor in the source worktree is an error
+// rather than a run without it. Running anyway is exactly the failure this
+// exists to prevent: the phases would measure the implementer's own tests and
+// report a confident answer about a test that never executed.
+func placeTest(p Params, wt string) error {
+	if p.TestFile == "" {
+		return fmt.Errorf("no test file was named for the control")
+	}
+	dst := filepath.Join(wt, p.TestFile)
+
+	if p.SourceWorktree != "" {
+		body, err := os.ReadFile(filepath.Join(p.SourceWorktree, p.TestFile))
+		switch {
+		case err == nil:
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				return fmt.Errorf("create scratch package dir for %s: %w", p.TestFile, err)
+			}
+			if err := os.WriteFile(dst, body, 0o644); err != nil {
+				return fmt.Errorf("copy %s into the scratch worktree: %w", p.TestFile, err)
+			}
+			return nil
+		case !os.IsNotExist(err):
+			return fmt.Errorf("read %s from the task worktree: %w", p.TestFile, err)
+		}
+	}
+
+	// Nothing to copy, so the branch must already carry it.
+	if _, err := os.Stat(dst); err != nil {
+		return fmt.Errorf(
+			"test %s is present neither at branch head nor in the task worktree, so the control has nothing to evaluate",
+			p.TestFile)
+	}
+	return nil
 }
 
 // revertImplementation restores every changed file except the verifier's test

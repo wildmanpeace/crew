@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -33,12 +34,23 @@ import (
 type step struct {
 	// SleepSeconds holds the process open, so a hung or killed worker can be
 	// reproduced without waiting on a real model.
-	SleepSeconds float64         `json:"sleep_seconds,omitempty"`
-	CostUSD      float64         `json:"cost_usd"`
-	Exit         int             `json:"exit"`
-	Report       json.RawMessage `json:"report,omitempty"`
-	NoReport     bool            `json:"no_report,omitempty"`
-	Subtype      string          `json:"subtype,omitempty"`
+	SleepSeconds float64 `json:"sleep_seconds,omitempty"`
+	CostUSD      float64 `json:"cost_usd"`
+	Exit         int     `json:"exit"`
+
+	// Files are written into the worktree before the report, so a step can
+	// leave the tree in the shape the real worker would have left it.
+	Files map[string]string `json:"files,omitempty"`
+
+	// Commit stands in for crew-run commit, which only the implementer has.
+	// A verifier has no commit verb and the hook denies it raw git, so its
+	// test necessarily reaches crew uncommitted — the state the negative
+	// control has to cope with.
+	Commit bool `json:"commit,omitempty"`
+
+	Report   json.RawMessage `json:"report,omitempty"`
+	NoReport bool            `json:"no_report,omitempty"`
+	Subtype  string          `json:"subtype,omitempty"`
 }
 
 func main() {
@@ -71,6 +83,19 @@ func main() {
 		time.Sleep(time.Duration(s.SleepSeconds * float64(time.Second)))
 	}
 
+	// Work first, then the report: the report is a claim about work already
+	// done, and it must never be swept into the worker's own commit.
+	if err := writeFiles(worktree, s.Files); err != nil {
+		fmt.Fprintf(os.Stderr, "fakeclaude: %v\n", err)
+		os.Exit(2)
+	}
+	if s.Commit {
+		if err := commitAll(worktree); err != nil {
+			fmt.Fprintf(os.Stderr, "fakeclaude: %v\n", err)
+			os.Exit(2)
+		}
+	}
+
 	if !s.NoReport && len(s.Report) > 0 {
 		if err := os.WriteFile(filepath.Join(worktree, ".crew-report.json"), s.Report, 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "fakeclaude: write report: %v\n", err)
@@ -97,6 +122,33 @@ func main() {
 	out, _ := json.Marshal(env)
 	fmt.Println(string(out))
 	os.Exit(s.Exit)
+}
+
+func writeFiles(worktree string, files map[string]string) error {
+	for rel, body := range files {
+		p := filepath.Join(worktree, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return fmt.Errorf("create %s: %w", filepath.Dir(rel), err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", rel, err)
+		}
+	}
+	return nil
+}
+
+// commitAll stands in for crew-run commit.
+func commitAll(worktree string) error {
+	for _, args := range [][]string{{"add", "-A"}, {"commit", "-qm", "work"}} {
+		cmd := exec.Command("git", append([]string{"-C", worktree}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=crew", "GIT_AUTHOR_EMAIL=crew@localhost",
+			"GIT_COMMITTER_NAME=crew", "GIT_COMMITTER_EMAIL=crew@localhost")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	return nil
 }
 
 func loadSteps(path string) ([]step, error) {

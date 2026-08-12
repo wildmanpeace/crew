@@ -91,3 +91,25 @@ func TestReviewPrintsTheMalformedEventWarning(t *testing.T) {
 		t.Errorf("review did not surface the malformed event warning:\n%s", out.String())
 	}
 }
+
+// Teardown kills the window and can remove the worktree before it records the
+// transition, so a store write that fails leaves a task the captain believes
+// is torn down still sitting in its old status. The destructive half already
+// happened; the least crew can do is say the recording did not.
+func TestTeardownReportsAFailureToPersist(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	a, _ := fixture(t)
+	readyTask(t, a, "alpha")
+
+	dir := a.Store.Dir()
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+
+	if err := a.Teardown("alpha", false); err == nil {
+		t.Fatal("a teardown whose status never persisted was reported as done")
+	}
+}

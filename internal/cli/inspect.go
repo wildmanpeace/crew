@@ -439,7 +439,9 @@ func (a *App) Teardown(taskID string, removeWorktree bool) error {
 		}
 		a.out("removed worktree %s\n", ts.Worktree)
 	}
-	a.setStatus(taskID, state.StatusTornDown, "torn down by the captain")
+	if err := a.setStatus(taskID, state.StatusTornDown, "torn down by the captain"); err != nil {
+		return fmt.Errorf("tore %s down, but recording that failed: %w", taskID, err)
+	}
 	a.emit(state.Event{TaskID: taskID, Kind: "torn_down"})
 	return nil
 }

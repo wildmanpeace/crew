@@ -42,6 +42,10 @@ type step struct {
 	// leave the tree in the shape the real worker would have left it.
 	Files map[string]string `json:"files,omitempty"`
 
+	// Uncommitted are written after the commit, standing in for an
+	// implementer's last edit that never reached a crew-run commit.
+	Uncommitted map[string]string `json:"uncommitted,omitempty"`
+
 	// Commit stands in for crew-run commit, which only the implementer has.
 	// A verifier has no commit verb and the hook denies it raw git, so its
 	// test necessarily reaches crew uncommitted — the state the negative
@@ -94,6 +98,10 @@ func main() {
 			fmt.Fprintf(os.Stderr, "fakeclaude: %v\n", err)
 			os.Exit(2)
 		}
+	}
+	if err := writeFiles(worktree, s.Uncommitted); err != nil {
+		fmt.Fprintf(os.Stderr, "fakeclaude: %v\n", err)
+		os.Exit(2)
 	}
 
 	if !s.NoReport && len(s.Report) > 0 {

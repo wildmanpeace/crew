@@ -272,6 +272,23 @@ func (l *Loop) completeVerifier(taskID string) error {
 
 	switch plan.Action {
 	case ActionReadyForReview:
+		// Review and verify look at the working tree, but approve and land
+		// bind the committed branch head. An implementer's edits after its
+		// last crew-run commit would otherwise be reviewed, verified and
+		// approved, then silently dropped at land time. The task goes back to
+		// an implementer rather than being blocked, because committing the
+		// work is something the implementer can still do.
+		if dirty, err := UncommittedWork(worktree, l.Cfg.VerifyTestSuffix); err != nil {
+			// A status that cannot be read is recorded rather than treated as
+			// dirty; crew approve re-checks the sha it is binding.
+			l.record(state.Event{TaskID: taskID, Kind: "watch_error",
+				Detail: "check task worktree is clean: " + err.Error()})
+		} else if len(dirty) > 0 {
+			l.record(state.Event{TaskID: taskID, Kind: "uncommitted_work",
+				Detail: "not sent for review: " + strings.Join(dirty, ", "), Payload: dirty})
+			return l.nextImplementer(taskID, []string{uncommittedFailure(dirty)})
+		}
+
 		head, _ := l.Repo.RevParse(BranchName(taskID, ts.Attempt))
 		l.Store.Update(func(st *state.State) error {
 			t := st.Tasks[taskID]
@@ -306,6 +323,14 @@ func (l *Loop) completeVerifier(taskID string) error {
 }
 
 const verifierRetryMarker = "crew:verifier-retried"
+
+// uncommittedFailure briefs the next implementer on work that never reached a
+// commit, in the same shape as any other unmet criterion.
+func uncommittedFailure(dirty []string) string {
+	return fmt.Sprintf(
+		"work is not committed, so it would be reviewed but never landed: %s; finish with crew-run commit",
+		strings.Join(dirty, ", "))
+}
 
 // nextImplementer starts the next cycle, clearing verifier-authored tests
 // first so the new implementer neither sees them nor can write to them.

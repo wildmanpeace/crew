@@ -618,6 +618,39 @@ func CleanVerifyTests(worktree, suffix string) ([]string, error) {
 	return removed, err
 }
 
+// UncommittedWork lists the implementer's own uncommitted changes in a task
+// worktree.
+//
+// Two kinds of file are excluded because they are never meant to be
+// committed and always present: the verifier's tests, which it has no way to
+// commit and which crew deletes between cycles, and the report a worker
+// writes on its way out. What is left is work that review and verify can see
+// but approve and land cannot.
+func UncommittedWork(worktree, verifySuffix string) ([]string, error) {
+	args := []string{"status", "--porcelain", "--", ".",
+		":(exclude)" + report.Filename, ":(exclude).crew"}
+	if verifySuffix != "" {
+		args = append(args, ":(exclude)*"+verifySuffix)
+	}
+	out, err := gitx.New(worktree).Run(args...)
+	if err != nil {
+		return nil, fmt.Errorf("read worktree status: %w", err)
+	}
+	var files []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Porcelain lines are "XY path"; the status letters never contain a
+		// space once the line is trimmed.
+		if _, path, ok := strings.Cut(line, " "); ok {
+			files = append(files, strings.TrimSpace(path))
+		}
+	}
+	return files, nil
+}
+
 // BranchName is the branch for a task attempt. Branches are namespaced by
 // attempt from the start, so a reframe never collides with the attempt it is
 // abandoning and the failed attempt stays readable.

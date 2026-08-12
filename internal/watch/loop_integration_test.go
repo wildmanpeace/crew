@@ -383,6 +383,66 @@ func TestVerifierAuthoredNegativeControlIsMeasuredAgainstTheVerifiersOwnTest(t *
 	}
 }
 
+// Review and verify look at the working tree; approve and land bind the
+// committed branch head. An implementer's final edit that never reached a
+// crew-run commit was therefore reviewed, verified and approved, and then
+// silently dropped at land time. The reviewed artifact has to be the one that
+// lands, so the transition is refused while the worktree is dirty and the task
+// goes back to an implementer that can still commit it.
+func TestUncommittedImplementerWorkIsNotSentForReview(t *testing.T) {
+	leaky := implStep(0.10)
+	leaky["uncommitted"] = map[string]string{
+		"ratelimit/bucket.go": e2eImplementation + "\n// a final edit that never reached crew-run commit\n",
+	}
+	h := newHarness(t, []map[string]any{
+		leaky,
+		negControlStep(0.05),
+		implStep(0.10), // the next cycle commits everything it wrote
+		negControlStep(0.05),
+	})
+	h.start("alpha")
+	ts := h.settle("alpha", state.StatusReadyForReview, state.StatusNeedsReframe,
+		state.StatusBlocked, state.StatusFailed)
+
+	if len(h.eventsOfKind("uncommitted_work")) == 0 {
+		t.Fatalf("a dirty worktree passed straight through to review; events: %+v", h.events())
+	}
+	if ts.Status != state.StatusReadyForReview {
+		t.Fatalf("Status = %q, want ready_for_review after the work was committed: %s", ts.Status, ts.Notes)
+	}
+	if ts.Cycle != 2 {
+		t.Fatalf("Cycle = %d, want 2; the task was not returned to an implementer", ts.Cycle)
+	}
+
+	// What the captain reviews must now be what lands.
+	wt := gitx.New(watch.WorktreePath(h.root, "alpha", 1))
+	clean, err := wt.IsCleanExcluding("*_crewverify_test.go", ".crew-report.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !clean {
+		out, _ := wt.Run("status", "--porcelain")
+		t.Fatalf("ready_for_review with uncommitted work still present:\n%s", out)
+	}
+}
+
+// The verifier's own test is never committed and never can be, so it must not
+// be mistaken for uncommitted implementation work — that would send every task
+// back for another cycle, forever.
+func TestTheVerifiersOwnTestDoesNotCountAsUncommittedWork(t *testing.T) {
+	h := newHarness(t, []map[string]any{implStep(0.10), negControlStep(0.05)})
+	h.start("alpha")
+	ts := h.settle("alpha", state.StatusReadyForReview, state.StatusNeedsReframe,
+		state.StatusBlocked, state.StatusFailed)
+
+	if evs := h.eventsOfKind("uncommitted_work"); len(evs) > 0 {
+		t.Fatalf("the verifier's own test was treated as uncommitted work: %+v", evs)
+	}
+	if ts.Status != state.StatusReadyForReview {
+		t.Fatalf("Status = %q, want ready_for_review: %s", ts.Status, ts.Notes)
+	}
+}
+
 // The other half of the guarantee: a verifier test that passes with the
 // implementation taken away must be caught. It is the same path as the test
 // above, so a copy-in that happened to leave the file out of the revert would

@@ -103,9 +103,16 @@ func Lock(root string) (release func() error, err error) {
 	f.Truncate(0)
 	fmt.Fprintf(f, "%d\n", os.Getpid())
 	return func() error {
+		// The file is unlinked while the lock is still held. Unlocking first
+		// left a window in which one starter could acquire the old inode
+		// through the path and another, after the unlink, could create and
+		// acquire a new one — two watches, both believing they were the only
+		// one. Unlinking first means a newcomer can only ever create a fresh
+		// inode, and only one of them can hold that.
+		err := os.Remove(path)
 		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
-		return os.Remove(path)
+		return err
 	}, nil
 }
 

@@ -118,6 +118,13 @@ func AttributeCriterion(worktree, command string, changedTests []string) TestTar
 	}
 	switch len(matches) {
 	case 0:
+		if !literalTestName(name) {
+			// The filter is a regexp or is quoted, so a literal lookup could
+			// never have matched and proves nothing about where the test came
+			// from. Calling that pre-existing waived the control for a test
+			// the branch may well have authored.
+			return TestTarget{Authorship: AuthorUnknown, RunArgs: args}
+		}
 		// The named test is not in anything the branch added, so it predates
 		// this work.
 		return target
@@ -126,6 +133,27 @@ func AttributeCriterion(worktree, command string, changedTests []string) TestTar
 	default:
 		return TestTarget{Authorship: AuthorUnknown, RunArgs: args}
 	}
+}
+
+// literalTestName reports whether a -run filter is a plain test name that can
+// be looked up as a declaration.
+//
+// go test -run takes a regexp, and the command is read from a string, so a
+// filter can arrive anchored, quoted, or as a subtest path. None of those can
+// match a "func Name(" declaration, and treating the miss as an answer turns a
+// missing lookup into a confident and wrong attribution.
+func literalTestName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // fileDeclaresTest reports whether a file declares the named test.

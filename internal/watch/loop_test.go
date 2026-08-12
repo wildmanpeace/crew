@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -388,5 +390,46 @@ func TestACorruptExitMarkerFailsTheRunRatherThanStallingIt(t *testing.T) {
 	}
 	if !sawDiagnostic {
 		t.Errorf("nothing was recorded explaining the stall: %+v", events(t, l))
+	}
+}
+
+// The lock must admit exactly one holder under contention.
+//
+// Release unlinks the file while the lock is still held. Unlocking first left
+// a window in which one starter could acquire the old inode through the path
+// while another, after the unlink, created and acquired a new one. The window
+// is narrow enough that this exercises it rather than proving it closed; what
+// it does guarantee is that nothing in the acquire/release cycle admits two
+// holders at once.
+func TestLockAdmitsOneHolderUnderContention(t *testing.T) {
+	root := t.TempDir()
+	var holders atomic.Int32
+	var doubled atomic.Bool
+	var wg sync.WaitGroup
+
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				release, err := Lock(root)
+				if err != nil {
+					continue // another goroutine holds it, which is the point
+				}
+				if holders.Add(1) != 1 {
+					doubled.Store(true)
+				}
+				holders.Add(-1)
+				release()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if doubled.Load() {
+		t.Fatal("two watches held the singleton lock at once")
+	}
+	if _, err := os.Stat(filepath.Join(root, ".crew", "watch.lock")); !os.IsNotExist(err) {
+		t.Errorf("the lock file outlived its holder: %v", err)
 	}
 }

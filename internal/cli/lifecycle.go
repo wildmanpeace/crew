@@ -34,6 +34,18 @@ func (a *App) Approve(taskID, sha string) error {
 	if ts.Status != state.StatusReadyForReview {
 		return fmt.Errorf("task %q is %s, not ready_for_review", taskID, ts.Status)
 	}
+	// Review and verify read the worktree; approval binds the committed head.
+	// Uncommitted edits are therefore reviewed and then dropped at land time,
+	// so they are refused here rather than approved and silently lost.
+	dirty, err := a.dirtyWorktreePaths(taskID, ts.Attempt)
+	if err != nil {
+		return err
+	}
+	if len(dirty) > 0 {
+		return fmt.Errorf(
+			"task %q has uncommitted changes in its worktree (%s); approval binds the committed head, so those edits would not land - commit them and review again",
+			taskID, strings.Join(dirty, ", "))
+	}
 	head, err := a.Repo.RevParse(BranchName(taskID, ts.Attempt))
 	if err != nil {
 		return fmt.Errorf("resolve branch head: %w", err)
@@ -55,6 +67,21 @@ func (a *App) Approve(taskID, sha string) error {
 	a.emit(state.Event{TaskID: taskID, Kind: "approved", Sha: head})
 	a.out("approved %s at %s\n", taskID, short(head))
 	return nil
+}
+
+// dirtyWorktreePaths lists a task attempt's uncommitted paths. A worktree
+// that is no longer on disk has no uncommitted work to lose, so it is not an
+// error here.
+func (a *App) dirtyWorktreePaths(taskID string, attempt int) ([]string, error) {
+	worktree := WorktreePath(a.Root, taskID, attempt)
+	if _, err := os.Stat(worktree); err != nil {
+		return nil, nil
+	}
+	dirty, err := gitx.New(worktree).DirtyPaths()
+	if err != nil {
+		return nil, fmt.Errorf("check %s worktree: %w", taskID, err)
+	}
+	return dirty, nil
 }
 
 // shaMatches accepts an abbreviated sha as long as it prefixes the full one.
@@ -102,6 +129,18 @@ func (a *App) Land(taskID string) error {
 			short(head), short(ts.ApprovedSha))
 	}
 
+	// The fast-forward below moves whatever the root repo has checked out, so
+	// landing with another ref checked out would advance that ref and leave
+	// main - the branch dependents are cut from - untouched.
+	current, err := a.Repo.CurrentBranch()
+	if err != nil {
+		return fmt.Errorf("resolve the checked-out branch: %w", err)
+	}
+	if current != a.Cfg.MainBranch {
+		return fmt.Errorf("the repository has %s checked out, not %s; check out %s before landing",
+			current, a.Cfg.MainBranch, a.Cfg.MainBranch)
+	}
+
 	// crew's own worktrees and scratch space live under .crew inside the repo,
 	// so they are excluded: they are never part of what lands.
 	clean, err := a.Repo.IsCleanExcluding(".crew")
@@ -112,9 +151,14 @@ func (a *App) Land(taskID string) error {
 		return fmt.Errorf("%s has uncommitted changes; commit or stash them before landing", a.Cfg.MainBranch)
 	}
 
-	merged, mergeErr := a.mergeInScratch(branch)
+	// The approved sha is merged, not the branch: the ref could have moved
+	// since it was resolved above, and only what was approved may land.
+	merged, mergeErr := a.mergeInScratch(branch, ts.ApprovedSha)
 	if mergeErr != nil {
-		a.setStatus(taskID, state.StatusLandConflict, mergeErr.Error())
+		if err := a.setStatus(taskID, state.StatusLandConflict, mergeErr.Error()); err != nil {
+			return fmt.Errorf("landing %s conflicts with %s: %v; and recording that failed: %w",
+				taskID, a.Cfg.MainBranch, mergeErr, err)
+		}
 		a.emit(state.Event{TaskID: taskID, Kind: "land_conflict", Detail: mergeErr.Error()})
 		return fmt.Errorf("landing %s conflicts with %s: %w; run crew rebase %s",
 			taskID, a.Cfg.MainBranch, mergeErr, taskID)
@@ -146,9 +190,10 @@ func (a *App) Land(taskID string) error {
 	return nil
 }
 
-// mergeInScratch merges branch into main inside a throwaway worktree and
-// returns the resulting commit.
-func (a *App) mergeInScratch(branch string) (string, error) {
+// mergeInScratch merges rev into main inside a throwaway worktree and returns
+// the resulting commit. branch names the merge for the commit message only;
+// what is merged is rev, so a branch that moves cannot change what lands.
+func (a *App) mergeInScratch(branch, rev string) (string, error) {
 	scratch := filepath.Join(a.Root, ".crew", "scratch")
 	if err := os.MkdirAll(scratch, 0o755); err != nil {
 		return "", err
@@ -169,7 +214,7 @@ func (a *App) mergeInScratch(branch string) (string, error) {
 
 	scratchRepo := gitx.New(wt)
 	if _, err := scratchRepo.Run("merge", "--no-ff", "-m",
-		fmt.Sprintf("crew: land %s", branch), branch); err != nil {
+		fmt.Sprintf("crew: land %s", branch), rev); err != nil {
 		scratchRepo.Run("merge", "--abort")
 		return "", err
 	}
@@ -245,11 +290,17 @@ func (a *App) Rebase(taskID string) error {
 	wtRepo := gitx.New(worktree)
 	if _, err := wtRepo.Run("rebase", a.Cfg.MainBranch); err != nil {
 		wtRepo.Run("rebase", "--abort")
-		a.setStatus(taskID, state.StatusLandConflict, err.Error())
+		if setErr := a.setStatus(taskID, state.StatusLandConflict, err.Error()); setErr != nil {
+			return fmt.Errorf("rebase %s onto %s failed: %v; and recording that failed: %w",
+				branch, a.Cfg.MainBranch, err, setErr)
+		}
 		return fmt.Errorf("rebase %s onto %s failed: %w", branch, a.Cfg.MainBranch, err)
 	}
 
-	head, _ := a.Repo.RevParse(branch)
+	head, err := a.Repo.RevParse(branch)
+	if err != nil {
+		return fmt.Errorf("resolve branch head: %w", err)
+	}
 	if _, err := a.Store.Update(func(st *state.State) error {
 		t := st.Tasks[taskID]
 		// The approval is bound to a sha the rebase has just rewritten.
@@ -283,7 +334,7 @@ func (a *App) Reframe(taskID string) error {
 	}
 	oldBranch := BranchName(taskID, ts.Attempt)
 
-	if _, err := a.Store.Update(func(st *state.State) error {
+	st, err := a.Store.Update(func(st *state.State) error {
 		t := st.Tasks[taskID]
 		t.Attempt++
 		t.Cycle = 0
@@ -298,10 +349,10 @@ func (a *App) Reframe(taskID string) error {
 		t.PendingIntent = nil
 		t.UpdatedAt = a.now()
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
-	st, _ := a.Store.Read()
 	a.emit(state.Event{TaskID: taskID, Kind: "reframed",
 		Detail: fmt.Sprintf("attempt %d abandoned (branch %s preserved); starting attempt %d",
 			ts.Attempt, oldBranch, st.Tasks[taskID].Attempt)})
@@ -310,8 +361,10 @@ func (a *App) Reframe(taskID string) error {
 	return nil
 }
 
-func (a *App) setStatus(taskID string, s state.Status, note string) {
-	a.Store.Update(func(st *state.State) error {
+// setStatus records a transition. It returns the store's error rather than
+// swallowing it, so a caller cannot report a transition it never persisted.
+func (a *App) setStatus(taskID string, s state.Status, note string) error {
+	_, err := a.Store.Update(func(st *state.State) error {
 		t := st.Tasks[taskID]
 		if t == nil {
 			return nil
@@ -321,6 +374,7 @@ func (a *App) setStatus(taskID string, s state.Status, note string) {
 		t.UpdatedAt = a.now()
 		return nil
 	})
+	return err
 }
 
 // DependenciesMet reports which of a task's dependencies have not landed.

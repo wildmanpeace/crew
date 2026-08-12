@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/wildmanpeace/crew/internal/config"
+	"github.com/wildmanpeace/crew/internal/tasks"
 )
 
 func mustProfile(t *testing.T, lang Language) Profile {
@@ -110,6 +111,33 @@ func TestWrittenAgentsMdSpeaksTheProjectsLanguage(t *testing.T) {
 	}
 }
 
+// The scaffolded TASKS.md carries a worked example inside a fenced code
+// block so a fresh project has something to imitate. That example must never
+// be mistaken for a real task, or a brand-new project fails to parse until
+// the captain hand-edits the stub.
+func TestScaffoldedTasksMdParsesToZeroTasks(t *testing.T) {
+	for _, lang := range Languages() {
+		t.Run(string(lang), func(t *testing.T) {
+			dir := t.TempDir()
+			if _, err := Write(dir, mustProfile(t, lang), false); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			f, err := os.Open(filepath.Join(dir, "TASKS.md"))
+			if err != nil {
+				t.Fatalf("open TASKS.md: %v", err)
+			}
+			defer f.Close()
+			got, err := tasks.Parse(f)
+			if err != nil {
+				t.Fatalf("the scaffolded TASKS.md does not parse: %v", err)
+			}
+			if len(got) != 0 {
+				t.Errorf("got %d tasks from the scaffold's worked example, want 0", len(got))
+			}
+		})
+	}
+}
+
 // Init runs against real projects, which already have these files.
 func TestWriteNeverClobbersWithoutForce(t *testing.T) {
 	dir := t.TempDir()
@@ -197,5 +225,41 @@ func TestSettingsMergeKeepsExistingKeysAndAddsTheDenyRule(t *testing.T) {
 	}
 	if n := strings.Count(read(t, dir, ".claude/settings.json"), ApproveDenyRule); n != 1 {
 		t.Errorf("the deny rule appears %d times, want 1", n)
+	}
+}
+
+// An existing settings.json whose shape crew doesn't expect must fail loudly
+// rather than have the unexpected value silently discarded and overwritten —
+// that would contradict the promise that init on an established project
+// cannot lose your own configuration.
+func TestSettingsMergeErrorsOnUnexpectedPermissionsShape(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, ".claude/settings.json", `{"permissions":"not-an-object"}`)
+
+	_, err := Write(dir, mustProfile(t, Go), false)
+	if err == nil {
+		t.Fatal("Write succeeded despite permissions being a string, not an object")
+	}
+	if !strings.Contains(err.Error(), "permissions") {
+		t.Errorf("error = %v, want it to name the offending key %q", err, "permissions")
+	}
+	if got := read(t, dir, ".claude/settings.json"); got != `{"permissions":"not-an-object"}` {
+		t.Errorf("settings.json was modified despite the error: %q", got)
+	}
+}
+
+func TestSettingsMergeErrorsOnUnexpectedDenyShape(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, ".claude/settings.json", `{"permissions":{"deny":"not-an-array"}}`)
+
+	_, err := Write(dir, mustProfile(t, Go), false)
+	if err == nil {
+		t.Fatal("Write succeeded despite deny being a string, not an array")
+	}
+	if !strings.Contains(err.Error(), "deny") {
+		t.Errorf("error = %v, want it to name the offending key %q", err, "deny")
+	}
+	if got := read(t, dir, ".claude/settings.json"); got != `{"permissions":{"deny":"not-an-array"}}` {
+		t.Errorf("settings.json was modified despite the error: %q", got)
 	}
 }

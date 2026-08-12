@@ -13,16 +13,43 @@ import (
 	"github.com/wildmanpeace/crew/internal/worker"
 )
 
+// notifyCommand returns the argv that delivers a desktop notification on
+// goos, or nil if no notifier is known for it.
+func notifyCommand(goos, title, body string) []string {
+	switch goos {
+	case "darwin":
+		script := fmt.Sprintf("display notification %q with title %q", body, title)
+		return []string{"osascript", "-e", script}
+	case "linux":
+		return []string{"notify-send", title, body}
+	default:
+		return nil
+	}
+}
+
+// deliverNotification runs argv, if there is one, and writes title and body
+// to fallback whenever there is nothing to run or running it fails.
+//
+// crew doctor --notify exists so a captain who isn't watching the terminal
+// still finds out. An OS with no known notifier, or a notifier that is not
+// installed, must not make that degrade all the way to nothing: the fallback
+// is what keeps the notification from vanishing without a trace.
+func deliverNotification(argv []string, title, body string, run func([]string) error, fallback io.Writer) {
+	if len(argv) > 0 && run(argv) == nil {
+		return
+	}
+	fmt.Fprintf(fallback, "notify: %s: %s\n", title, body)
+}
+
 // Notify delivers a best-effort desktop notification.
 //
 // The durable record is always .crew/events.jsonl; this is only the nudge, so
-// a missing or failing notifier is never an error.
+// a missing or failing notifier is never an error -- but it is never silent
+// either, since a captain relying on --notify has nothing else to go on.
 func Notify(title, body string) {
-	if runtime.GOOS != "darwin" {
-		return
-	}
-	script := fmt.Sprintf("display notification %q with title %q", body, title)
-	_ = exec.Command("osascript", "-e", script).Run()
+	deliverNotification(notifyCommand(runtime.GOOS, title, body), title, body,
+		func(argv []string) error { return exec.Command(argv[0], argv[1:]...).Run() },
+		os.Stderr)
 }
 
 // WorkerClaudeMdExcludes lists the memory files a worker must not load.

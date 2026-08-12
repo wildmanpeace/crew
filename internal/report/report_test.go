@@ -214,6 +214,27 @@ func TestMechanicalZeroExitWithMetFalseStillFails(t *testing.T) {
 	}
 }
 
+// LoadVerifier requires command and exit_code on a mechanical check but not
+// met, so a report can validate with met entirely absent. Satisfied still
+// treats an absent met the same as an explicit false: the clean exit code
+// only rules out failure, it does not stand in for the verifier's own claim
+// that the criterion is met. This is intentional (see the comment on
+// Satisfied) -- a report is a claim, not evidence, and an under-claimed
+// report should not read as satisfied by default.
+func TestMechanicalCleanExitWithoutMetIsUnsatisfied(t *testing.T) {
+	dir := writeReport(t, `{"task_id":"a","role":"verifier","status":"satisfied",
+	  "criteria_results":[
+	    {"description":"d","evaluation":"mechanical_check","command":"crew-check test","exit_code":0}
+	  ]}`)
+	r, err := LoadVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadVerifier rejected a mechanical check with no met, want it accepted: %v", err)
+	}
+	if r.CriteriaResults[0].Satisfied() {
+		t.Fatal("criterion with a clean exit code but no met claim reported as satisfied")
+	}
+}
+
 func TestVerifierTestFileMustCarryTheVerifySuffix(t *testing.T) {
 	dir := writeReport(t, `{"task_id":"a","role":"verifier","status":"satisfied",
 	  "criteria_results":[{"description":"d","evaluation":"negative_control_test","test_file":"middleware/sneaky.go"}]}`)

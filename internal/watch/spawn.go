@@ -254,7 +254,15 @@ func (l *Loop) completeVerifier(taskID string) error {
 
 	if r != nil && loadErr == nil {
 		if err := l.runNegativeControls(taskID, r); err != nil {
-			l.record(state.Event{TaskID: taskID, Kind: "watch_error", Detail: err.Error()})
+			// A control that could not run is not a control that passed.
+			// Recording the error and carrying on left every provisional claim
+			// standing, so a transient git failure silently waived the whole
+			// pass and still reported it as mechanical evidence.
+			downgraded := DowngradeUncontrolled(r, err)
+			l.emit(state.Event{TaskID: taskID, Kind: "negative_control_failed",
+				Detail: fmt.Sprintf("%v; %d criterion(s) fall back to judgment",
+					err, len(downgraded)),
+				Payload: downgraded})
 		}
 		l.persistCriteria(taskID, r)
 	}

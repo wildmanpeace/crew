@@ -564,6 +564,43 @@ func TestSpawnIsRefusedOnceTheTaskCapIsSpent(t *testing.T) {
 	}
 }
 
+// A transient spawn failure returns the task to queued. Before this, the next
+// poll always started a cycle-1 implementer, so a verifier that failed to
+// spawn silently became a fresh implementation attempt: the work already done
+// was never verified and the cycle cap started over.
+func TestAFailedVerifierSpawnResumesTheVerifierNotAFreshImplementer(t *testing.T) {
+	h := newHarness(t, []map[string]any{
+		{"cost_usd": 0.01, "exit": 0, "sleep_seconds": 30, "no_report": true},
+	})
+	if err := h.app.Spawn("alpha", false); err != nil {
+		t.Fatal(err)
+	}
+	// The shape a failed worker.Spawn leaves behind: back to queued, with the
+	// role and cycle the spawn was attempting still recorded.
+	h.loop.Store.Update(func(st *state.State) error {
+		ts := st.Tasks["alpha"]
+		ts.Status = state.StatusQueued
+		ts.Role = string(config.RoleVerifier)
+		ts.Cycle = 2
+		return nil
+	})
+	if err := h.loop.Tick(t.Context()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	st, _ := h.loop.Store.Read()
+	ts := st.Tasks["alpha"]
+	if ts.Role != string(config.RoleVerifier) {
+		t.Fatalf("Role = %q, want verifier; the failed verifier spawn restarted as an implementer", ts.Role)
+	}
+	if ts.Cycle != 2 {
+		t.Fatalf("Cycle = %d, want 2; the cycle cap restarted", ts.Cycle)
+	}
+	if ts.RunID != "alpha-a1-c2-verify" {
+		t.Errorf("RunID = %q, want alpha-a1-c2-verify", ts.RunID)
+	}
+}
+
 // A crash between recording a spawn intent and creating the window must be
 // repaired, not left stranded.
 func TestCrashBetweenIntentAndEffectIsRepaired(t *testing.T) {

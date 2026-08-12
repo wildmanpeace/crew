@@ -248,3 +248,37 @@ func TestOutcomeNamesEveryUnmetCriterion(t *testing.T) {
 		t.Fatalf("allClear = %v, failures = %v", allClear, failures)
 	}
 }
+
+// A task queued by crew spawn has never run, so it starts at the beginning.
+func TestAFreshlyQueuedTaskStartsAtCycleOne(t *testing.T) {
+	role, cycle := ResumeStep(&state.TaskState{ID: "alpha", Status: state.StatusQueued})
+	if role != config.RoleImplementer || cycle != 1 {
+		t.Fatalf("ResumeStep = %q cycle %d, want implementer cycle 1", role, cycle)
+	}
+}
+
+// A spawn that failed transiently leaves the role and cycle it was attempting
+// recorded. Restarting such a task at cycle 1 silently rerouted a verifier
+// into a fresh implementer: the work already done was never verified and the
+// cycle cap started over.
+func TestAFailedVerifierSpawnResumesAsTheVerifier(t *testing.T) {
+	role, cycle := ResumeStep(&state.TaskState{
+		ID: "alpha", Status: state.StatusQueued, Role: "verifier", Cycle: 3,
+	})
+	if role != config.RoleVerifier {
+		t.Fatalf("ResumeStep role = %q, want verifier; the verifier was rerouted", role)
+	}
+	if cycle != 3 {
+		t.Fatalf("ResumeStep cycle = %d, want 3; the cycle cap restarted", cycle)
+	}
+}
+
+// The same holds for an implementer: a failed cycle-3 spawn resumes at cycle 3.
+func TestAFailedImplementerSpawnKeepsItsCycle(t *testing.T) {
+	role, cycle := ResumeStep(&state.TaskState{
+		ID: "alpha", Status: state.StatusQueued, Role: "implementer", Cycle: 3,
+	})
+	if role != config.RoleImplementer || cycle != 3 {
+		t.Fatalf("ResumeStep = %q cycle %d, want implementer cycle 3", role, cycle)
+	}
+}

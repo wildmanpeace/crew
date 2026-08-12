@@ -1,10 +1,12 @@
 package watch
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -318,5 +320,73 @@ func TestSpendFromABudgetExhaustedRunIsStillRecorded(t *testing.T) {
 	st, _ = l.Store.Read()
 	if st.Tasks["alpha"].SpendUSD == 0 {
 		t.Fatal("spend from a budget-exhausted run was not recorded")
+	}
+}
+
+// events returns everything the loop has recorded.
+func events(t *testing.T, l *Loop) []state.Event {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(l.Root, ".crew", "events.jsonl"))
+	if err != nil {
+		return nil
+	}
+	var out []state.Event
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var ev state.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("parse event %q: %v", line, err)
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+// A truncated exit marker left the task in running forever: the poll skipped
+// it on every pass, so it held a concurrency slot, never reached reconcile and
+// so could not even time out, and wrote nothing to events.jsonl explaining
+// itself.
+func TestACorruptExitMarkerFailsTheRunRatherThanStallingIt(t *testing.T) {
+	l := loop(t)
+	runs := filepath.Join(l.Root, ".crew", "runs")
+	if err := os.MkdirAll(runs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A marker truncated mid-write by a crash.
+	if err := os.WriteFile(filepath.Join(runs, "alpha-a1-c1-impl.exit"), []byte("1\x00tr"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l.Store.Update(func(st *state.State) error {
+		st.Upsert(&state.TaskState{ID: "alpha", Status: state.StatusRunning,
+			Attempt: 1, Cycle: 1, RunID: "alpha-a1-c1-impl", Window: "crew-alpha-a1-c1-impl"})
+		return nil
+	})
+
+	if err := l.Tick(t.Context()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	st, _ := l.Store.Read()
+	ts := st.Tasks["alpha"]
+
+	if ts.Status.InFlight() {
+		t.Fatalf("Status = %q; the stalled task is still holding a concurrency slot", ts.Status)
+	}
+	if ts.Status != state.StatusFailed {
+		t.Fatalf("Status = %q, want failed", ts.Status)
+	}
+	if !strings.Contains(ts.Notes, "alpha-a1-c1-impl") {
+		t.Errorf("Notes = %q, want it to name the run", ts.Notes)
+	}
+
+	var sawDiagnostic bool
+	for _, ev := range events(t, l) {
+		if ev.Kind == "watch_error" && strings.Contains(ev.Detail, "exit marker") {
+			sawDiagnostic = true
+		}
+	}
+	if !sawDiagnostic {
+		t.Errorf("nothing was recorded explaining the stall: %+v", events(t, l))
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -118,38 +119,66 @@ func Load(projectRoot string) (*Config, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	c.applyDefaults()
+	set, err := configuredKeys(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	c.applyDefaults(set)
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
 	return &c, nil
 }
 
-func (c *Config) applyDefaults() {
-	setInt := func(p *int, v int) {
-		if *p == 0 {
+// configuredKeys names the top-level keys the file actually sets.
+//
+// A number's zero value is indistinguishable from an omitted key once it is
+// decoded, and for these settings the difference matters: the loop reads
+// `wall_clock_timeout_seconds <= 0` as "no wall clock", so defaulting a
+// configured 0 made that documented setting unreachable. Reading presence off
+// the raw JSON keeps the field types plain ints and floats for every consumer.
+func configuredKeys(raw []byte) (map[string]bool, error) {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		return nil, err
+	}
+	set := make(map[string]bool, len(keys))
+	for k := range keys {
+		set[k] = true
+	}
+	return set, nil
+}
+
+// applyDefaults fills the settings the file left out. A nil set means nothing
+// was configured, which is what a Config built in code wants.
+func (c *Config) applyDefaults(set map[string]bool) {
+	setInt := func(key string, p *int, v int) {
+		if !set[key] {
 			*p = v
 		}
 	}
-	setFloat := func(p *float64, v float64) {
-		if *p == 0 {
+	setFloat := func(key string, p *float64, v float64) {
+		if !set[key] {
 			*p = v
 		}
 	}
+	// Strings stay on an emptiness check. An explicitly empty branch name,
+	// suffix, or model is not a setting anyone means, so there is nothing to
+	// distinguish from an omitted key.
 	setStr := func(p *string, v string) {
 		if *p == "" {
 			*p = v
 		}
 	}
-	setInt(&c.ConcurrencyCap, 3)
-	setInt(&c.PollIntervalSeconds, 15)
-	setInt(&c.WallClockTimeoutSeconds, 1800)
-	setInt(&c.MaxCycles, 3)
-	setFloat(&c.PerTaskCostCapUSD, 5.00)
-	setFloat(&c.ProjectCostCapUSDPerDay, 25.00)
-	setFloat(&c.PerWorkerBudgetUSD, 1.50)
-	setFloat(&c.BudgetSafetyMargin, 0.25)
-	setFloat(&c.MinSpawnBudgetUSD, 0.10)
+	setInt("concurrency_cap", &c.ConcurrencyCap, 3)
+	setInt("poll_interval_seconds", &c.PollIntervalSeconds, 15)
+	setInt("wall_clock_timeout_seconds", &c.WallClockTimeoutSeconds, 1800)
+	setInt("max_cycles", &c.MaxCycles, 3)
+	setFloat("per_task_cost_cap_usd", &c.PerTaskCostCapUSD, 5.00)
+	setFloat("project_cost_cap_usd_per_day", &c.ProjectCostCapUSDPerDay, 25.00)
+	setFloat("per_worker_budget_usd", &c.PerWorkerBudgetUSD, 1.50)
+	setFloat("budget_safety_margin", &c.BudgetSafetyMargin, 0.25)
+	setFloat("min_spawn_budget_usd", &c.MinSpawnBudgetUSD, 0.10)
 	setStr(&c.BudgetTimezone, "America/Denver")
 	setStr(&c.MainBranch, "main")
 	setStr(&c.VerifyTestSuffix, "_crewverify_test.go")
@@ -208,9 +237,89 @@ func (c *Config) Location() (*time.Location, error) {
 	return loc, nil
 }
 
+// workerFlags is the closed set of flags a worker may pass to a check
+// command, mapped to whether the flag takes a value.
+//
+// Everything here is a selector: which packages, which tests, how long they
+// get, how they are reported. Nothing here names a program to run or a file to
+// write, and that is the whole point. `go test -exec <prog>` and
+// `-toolexec <prog>` execute an arbitrary program, and `-o <path>` writes one;
+// a verifier reaching any of them would have a commit path despite having no
+// commit verb. The set is closed rather than a deny list so a flag nobody
+// thought about is absent by construction.
+var workerFlags = map[string]bool{
+	"run":      true,
+	"skip":     true,
+	"bench":    true,
+	"count":    true,
+	"timeout":  true,
+	"parallel": true,
+	"tags":     true,
+	"v":        false,
+	"race":     false,
+	"short":    false,
+	"failfast": false,
+	"cover":    false,
+	"json":     false,
+}
+
+// permittedFlags renders the allow-list for an error message.
+func permittedFlags() string {
+	names := make([]string, 0, len(workerFlags))
+	for name := range workerFlags {
+		names = append(names, "-"+name)
+	}
+	slices.Sort(names)
+	return strings.Join(names, " ")
+}
+
+// checkWorkerArgs reports the first worker-supplied argument that is not a
+// selector.
+//
+// A positional argument is a package pattern and passes. A flag passes only if
+// workerFlags names it, in either the -flag=value or the -flag value spelling,
+// with one dash or two — Go's flag parsing accepts all four, so validating one
+// spelling would validate nothing. A value that is itself flag-shaped is
+// refused rather than swallowed, because a swallowed value reaches the command
+// unexamined.
+func checkWorkerArgs(verb string, args []string) error {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		spelling, _, inline := strings.Cut(arg, "=")
+		name := strings.TrimPrefix(strings.TrimPrefix(spelling, "-"), "-")
+
+		// A bare "-" or "--" trims to nothing and is not a selector either.
+		takesValue, permitted := workerFlags[name]
+		if !permitted {
+			return fmt.Errorf(
+				"check_commands.%s: argument %q is not permitted; a worker may pass package selectors and these flags: %s",
+				verb, spelling, permittedFlags())
+		}
+		if inline || !takesValue {
+			continue
+		}
+		if i+1 >= len(args) {
+			return fmt.Errorf("check_commands.%s: flag %q needs a value", verb, spelling)
+		}
+		if next := args[i+1]; strings.HasPrefix(next, "-") {
+			return fmt.Errorf("check_commands.%s: flag %q needs a value, got the flag %q",
+				verb, spelling, next)
+		}
+		i++
+	}
+	return nil
+}
+
 // Resolve composes the argv for a configured verb. Worker-supplied arguments
 // replace the configured defaults; when the worker supplies none, the
 // defaults apply. An unconfigured verb is a hard error.
+//
+// Worker arguments are checked against the allow-list; configured defaults are
+// not, because they are the captain's own and a project that needs an exec
+// wrapper can say so in its config.
 func (c *Config) Resolve(verb string, workerArgs []string) ([]string, error) {
 	cmd, ok := c.CheckCommands[verb]
 	if !ok {
@@ -218,6 +327,9 @@ func (c *Config) Resolve(verb string, workerArgs []string) ([]string, error) {
 	}
 	argv := slices.Clone(cmd.Argv)
 	if len(workerArgs) > 0 {
+		if err := checkWorkerArgs(verb, workerArgs); err != nil {
+			return nil, err
+		}
 		return append(argv, workerArgs...), nil
 	}
 	return append(argv, cmd.DefaultArgs...), nil

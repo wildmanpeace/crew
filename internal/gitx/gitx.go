@@ -71,21 +71,26 @@ func (r Repo) ChangedFiles(from, to string) ([]Change, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseNameStatus(out), nil
+}
+
+// parseNameStatus turns git's name-status output into changes. Anything it
+// cannot read as a status letter and a path is skipped rather than trusted:
+// the output is git's, but a truncated or empty field must not panic here.
+func parseNameStatus(out string) []Change {
 	var changes []Change
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
 		fields := strings.SplitN(line, "\t", 2)
 		if len(fields) != 2 {
 			continue
 		}
-		changes = append(changes, Change{
-			Status: strings.TrimSpace(fields[0])[:1],
-			Path:   strings.TrimSpace(fields[1]),
-		})
+		status, path := strings.TrimSpace(fields[0]), strings.TrimSpace(fields[1])
+		if status == "" || path == "" {
+			continue
+		}
+		changes = append(changes, Change{Status: status[:1], Path: path})
 	}
-	return changes, nil
+	return changes
 }
 
 // AddWorktreeDetached checks out a revision into a new detached worktree.
@@ -164,15 +169,38 @@ func (r Repo) IsClean() (bool, error) { return r.IsCleanExcluding() }
 // look dirty and block landing. Excluding it here means the check does not
 // depend on the project remembering to gitignore crew's own files.
 func (r Repo) IsCleanExcluding(excludes ...string) (bool, error) {
+	dirty, err := r.DirtyPaths(excludes...)
+	if err != nil {
+		return false, err
+	}
+	return len(dirty) == 0, nil
+}
+
+// DirtyPaths lists the paths with uncommitted changes, tracked or not,
+// ignoring the given paths.
+//
+// It is IsCleanExcluding with the detail kept: a refusal that names what is
+// dirty tells the captain what to commit, where a bare "not clean" does not.
+func (r Repo) DirtyPaths(excludes ...string) ([]string, error) {
 	args := []string{"status", "--porcelain", "--", "."}
 	for _, e := range excludes {
 		args = append(args, ":(exclude)"+e)
 	}
 	out, err := r.Run(args...)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	return strings.TrimSpace(out) == "", nil
+	var paths []string
+	// The output is split as-is: the status columns are positional, and
+	// trimming the whole block would eat the leading column of the first line.
+	for _, line := range strings.Split(out, "\n") {
+		// Porcelain v1: two status columns, a space, then the path.
+		if len(line) < 4 {
+			continue
+		}
+		paths = append(paths, strings.TrimSpace(line[3:]))
+	}
+	return paths, nil
 }
 
 // Diff returns the diff between rev and the working tree, excluding paths

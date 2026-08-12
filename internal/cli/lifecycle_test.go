@@ -165,6 +165,31 @@ func TestApproveSucceedsOnCurrentHead(t *testing.T) {
 	}
 }
 
+// Review and verify read the task worktree, but an approval binds the
+// committed head. Approving over uncommitted edits would approve work that
+// cannot land.
+func TestApproveRefusesADirtyTaskWorktree(t *testing.T) {
+	a, _ := fixture(t)
+	head := readyTask(t, a, "alpha")
+
+	// One untracked and one modified path, so both porcelain shapes are named.
+	wt := WorktreePath(a.Root, "alpha", 1)
+	writeFile(t, filepath.Join(wt, "late.txt"), "written after the last commit\n")
+	writeFile(t, filepath.Join(wt, "alpha.txt"), "edited after the last commit\n")
+
+	err := a.Approve("alpha", head)
+	if err == nil {
+		t.Fatal("approved a task with uncommitted edits in its worktree")
+	}
+	if !strings.Contains(err.Error(), "late.txt") || !strings.Contains(err.Error(), "alpha.txt") {
+		t.Errorf("err = %v; it must name the dirty paths", err)
+	}
+	ts, _ := a.taskState("alpha")
+	if ts.Status == state.StatusApproved {
+		t.Fatal("the task was approved anyway")
+	}
+}
+
 func TestLandRequiresApproval(t *testing.T) {
 	a, _ := fixture(t)
 	readyTask(t, a, "alpha")
@@ -216,6 +241,82 @@ func TestLandFastForwardsMainAndMarksLanded(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(a.Root, "alpha.txt")); err != nil {
 		t.Errorf("landed work is not present on main: %v", err)
+	}
+}
+
+// The merge must bind the approved commit, not whatever the branch points at
+// by the time git runs: the ref can move between the head check and the merge.
+func TestMergeInScratchMergesTheApprovedShaNotTheBranchRef(t *testing.T) {
+	a, _ := fixture(t)
+	approved := readyTask(t, a, "alpha")
+
+	// The branch moves after the approved sha was resolved.
+	wt := WorktreePath(a.Root, "alpha", 1)
+	writeFile(t, filepath.Join(wt, "unapproved.txt"), "never reviewed\n")
+	wtRepo := gitx.New(wt)
+	mustRun(t, wtRepo, "add", "-A")
+	mustRun(t, wtRepo, "commit", "-qm", "unapproved")
+
+	merged, err := a.mergeInScratch(BranchName("alpha", 1), approved)
+	if err != nil {
+		t.Fatalf("mergeInScratch: %v", err)
+	}
+	files, err := a.Repo.Run("ls-tree", "-r", "--name-only", merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(files, "alpha.txt") {
+		t.Errorf("the approved work is missing from the merge:\n%s", files)
+	}
+	if strings.Contains(files, "unapproved.txt") {
+		t.Errorf("a commit that was never approved was merged:\n%s", files)
+	}
+}
+
+// Landing fast-forwards main in the root repo. With something else checked
+// out, that fast-forward would advance the other ref and main would never
+// move, so the mismatch is refused rather than silently recorded as landed.
+func TestLandRefusesWhenMainIsNotCheckedOut(t *testing.T) {
+	a, _ := fixture(t)
+	head := readyTask(t, a, "alpha")
+	if err := a.Approve("alpha", head); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, a.Repo, "checkout", "-q", "-b", "captain-wip")
+	before, _ := a.Repo.RevParse("main")
+
+	err := a.Land("alpha")
+	if err == nil {
+		t.Fatal("landed with a branch other than main checked out")
+	}
+	if !strings.Contains(err.Error(), "captain-wip") {
+		t.Errorf("err = %v; it must name what is checked out", err)
+	}
+	if after, _ := a.Repo.RevParse("main"); after != before {
+		t.Error("main moved")
+	}
+	ts, _ := a.taskState("alpha")
+	if ts.Status != state.StatusApproved {
+		t.Fatalf("Status = %q, want approved", ts.Status)
+	}
+}
+
+// A status transition that could not be persisted must not be reported done.
+func TestSetStatusReportsAFailureToPersist(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	a, _ := fixture(t)
+	readyTask(t, a, "alpha")
+
+	dir := a.Store.Dir()
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+
+	if err := a.setStatus("alpha", state.StatusLandConflict, "conflicted"); err == nil {
+		t.Fatal("a status transition that never persisted was reported as done")
 	}
 }
 

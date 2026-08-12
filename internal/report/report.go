@@ -105,6 +105,22 @@ func (c CriterionResult) Judged() bool { return c.Evaluation == EvalJudged }
 // Satisfied reports whether the criterion is met. For a mechanical check a
 // non-zero exit code fails it regardless of what the verifier claimed:
 // judgment can add failures on top of a clean mechanical run, never erase one.
+//
+// That "never erase" rule is a one-way downgrade, not a substitute for the
+// verifier's own claim: exit_code is required by LoadVerifier for a
+// mechanical check, but met is not, and Satisfied still requires met to be
+// explicitly true regardless of evaluation kind. A clean exit code makes a
+// failure impossible; it does not make met optional. So a mechanical check
+// that ran clean but never got an explicit "met": true -- an incomplete
+// report, not a rejected one -- reads as unsatisfied, the same as an
+// explicit "met": false would. That is intentional, not an oversight: this
+// package's whole premise is that a report is a claim, not evidence, and the
+// safe default for an approval gate is to require the claim rather than to
+// infer it from a number the verifier could just as easily have gotten
+// wrong. Everywhere crew itself computes met on the verifier's behalf --
+// ApplyNegativeControl and ApplySelfAuthoredControl in internal/watch/plan.go
+// -- it sets an explicit true or false rather than leaving it nil, so this
+// path is only ever exercised by a report that under-claimed.
 func (c CriterionResult) Satisfied() bool {
 	if c.Evaluation == EvalMechanical && c.ExitCode != nil && *c.ExitCode != 0 {
 		return false

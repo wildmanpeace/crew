@@ -142,12 +142,16 @@ func splitSections(r io.Reader) ([]section, error) {
 	return out, nil
 }
 
-// fenceMarker reports whether line opens or closes a fenced code block, per
-// CommonMark: a run of three or more identical backticks or tildes, indented
-// at most three spaces. A closing fence must consist of the run and nothing
-// but trailing whitespace; a backtick fence's opening line cannot itself
-// contain a backtick (that ambiguity is left to the writer, not this
-// heuristic).
+// fenceMarker reports whether line opens or closes a fenced code block: a run
+// of three or more identical backticks or tildes, indented at most three
+// spaces. A backtick fence's line cannot itself contain a backtick, per
+// CommonMark's info-string rule.
+//
+// It deliberately stops short of full CommonMark: an info string on a closing
+// fence is accepted rather than rejected, so a second "```markdown" closes an
+// open block instead of being read as body text. Skipping a heading crew was
+// never meant to parse is the job here, and being liberal about what ends a
+// fence keeps an unbalanced document from swallowing every task after it.
 func fenceMarker(line string) (ch byte, n int, ok bool) {
 	trimmed := strings.TrimLeft(line, " ")
 	if len(line)-len(trimmed) > 3 || trimmed == "" {

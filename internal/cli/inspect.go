@@ -36,7 +36,13 @@ func (a *App) Review(taskID string) error {
 	a.out("task:    %s\nstatus:  %s\nattempt: %d (cycle %d)\nbranch:  %s\nhead:    %s\nspend:   $%.2f\n\n",
 		taskID, ts.Status, ts.Attempt, ts.Cycle, branch, head, ts.SpendUSD)
 
-	results, ratio := a.lastCriteria(taskID)
+	results, ratio, warning := a.lastCriteria(taskID)
+	if warning != "" {
+		// This is the surface the captain approves from, so a log the reader
+		// could not fully trust has to say so here, not just in a log
+		// somewhere else no one is looking at.
+		a.out("%s\n\n", warning)
+	}
 	if len(results) == 0 {
 		a.out("No criteria results recorded yet.\n\n")
 	} else {
@@ -97,16 +103,26 @@ func (a *App) Review(taskID string) error {
 	return nil
 }
 
-// lastCriteria returns the crew-authored criteria results from the event log.
-// crew's own findings, not the verifier's provisional claims, are what is
-// shown.
-func (a *App) lastCriteria(taskID string) ([]report.CriterionResult, string) {
+// lastCriteria returns the crew-authored criteria results from the event log,
+// plus a warning if any line could not be parsed. crew's own findings, not
+// the verifier's provisional claims, are what is shown.
+//
+// A malformed line is surfaced rather than swallowed: this is the captain's
+// approval surface, and a corrupt or truncated trailing line (a crash mid-
+// append) could be exactly the record that would have superseded what is
+// shown, which makes silent staleness the worst possible outcome here. A hard
+// failure that shows nothing would be safer still, but it throws away
+// results that parsed cleanly for the sake of one that didn't; a loud warning
+// next to whatever could still be recovered gives the captain the same
+// information without that cost.
+func (a *App) lastCriteria(taskID string) ([]report.CriterionResult, string, string) {
 	raw, err := os.ReadFile(a.Store.EventsPath())
 	if err != nil {
-		return nil, ""
+		return nil, "", ""
 	}
 	var results []report.CriterionResult
 	var ratio string
+	var malformed int
 	for _, line := range strings.Split(string(raw), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
@@ -118,13 +134,20 @@ func (a *App) lastCriteria(taskID string) ([]report.CriterionResult, string) {
 			Payload []report.CriterionResult `json:"payload"`
 		}
 		if json.Unmarshal([]byte(line), &ev) != nil {
+			malformed++
 			continue
 		}
 		if ev.TaskID == taskID && ev.Kind == "criteria_results" {
 			results, ratio = ev.Payload, ev.Ratio
 		}
 	}
-	return results, ratio
+	var warning string
+	if malformed > 0 {
+		warning = fmt.Sprintf(
+			"WARNING: %d line(s) of %s could not be parsed. If one of them was a newer criteria_results record for this task, what follows is STALE.",
+			malformed, filepath.Base(a.Store.EventsPath()))
+	}
+	return results, ratio, warning
 }
 
 // StatusReport is the machine-readable form of crew status.

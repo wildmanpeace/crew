@@ -59,48 +59,54 @@ at startup, which is the only place a worker can reach one.
 
 ## Set up a project
 
-crew drives a git repository from the outside. In the project you want driven,
-create `.crew/config.json` — its presence is what marks the project root, and
-crew walks up from your working directory to find it:
+crew drives a git repository from the outside. From inside the project you want
+driven:
 
-```json
-{
-  "main_branch": "main",
-  "implementer_model": "sonnet",
-  "verifier_model": "sonnet",
-  "check_commands": {
-    "test":  { "argv": ["go", "test"],  "default_args": ["./..."] },
-    "build": { "argv": ["go", "build"], "default_args": ["./..."] },
-    "lint":  { "argv": ["go", "vet"],   "default_args": ["./..."] }
-  }
-}
+```bash
+crew init
 ```
 
-Every other field has a default; see [Configuration](#configuration).
+It detects the language from `go.mod`, `package.json`, `*.csproj`/`*.sln`, or
+`pubspec.yaml` — pass `--lang go|typescript|csharp|dart` if the repo is
+polyglot or bare — and writes:
+
+| | |
+|---|---|
+| `.crew/config.json` | check commands, test suffixes, build-failure markers |
+| `AGENTS.md` | the first mate's role, with examples in your language |
+| `CLAUDE.md` | imports `AGENTS.md`, since Claude Code reads only `CLAUDE.md` |
+| `TASKS.md` | a stub explaining the task format |
+| `.gitignore` | crew's working files, **appended** to what is already there |
+| `.claude/settings.json` | the `crew approve` deny rule, **merged** into existing keys |
+
+Files crew owns are skipped if they already exist — `--force` overwrites.
+`.gitignore` and `.claude/settings.json` are never overwritten, only merged, so
+running init on an established project cannot lose your own configuration.
+Rerunning it is safe.
+
+Then it preflights the things that otherwise fail later and less clearly: is
+this a git repository, does `main_branch` exist, is `claude` on PATH, is `tmux`
+installed, are the dispatchers findable. A missing dependency still writes the
+files — it is fixable in a minute — but exits non-zero and says which.
+
+The three settings init exists for are the ones that fail *silently* when
+wrong. `test_file_suffix` decides whether crew recognises a test as new, and
+therefore whether a criterion is controlled at all. `verify_test_suffix` has to
+be collected by your test runner, or the verifier writes tests that never run.
+The build-failure markers separate a compile failure from a real assertion
+failure — both exit non-zero. None of those produce an error when misconfigured.
+They produce green ticks.
 
 Check commands are argv arrays, never shell strings. Nothing in crew ever
 constructs a shell invocation, so metacharacters in any argument are inert.
-
-Then add `.crew/` working files to the project's `.gitignore` — everything
-except `config.json`, which is project intent and belongs in version control:
-
-```gitignore
-/.crew/state.json
-/.crew/events.jsonl
-/.crew/*.lock
-/.crew/runs/
-/.crew/worktrees/
-/.crew/scratch/
-/.crew/bin/
-/.crew/implementer-settings.json
-/.crew/verifier-settings.json
-/.crew-report.json
-```
+Everything init leaves out of `config.json` takes crew's default; see
+[Configuration](#configuration).
 
 ## Declare a task
 
 `TASKS.md` at the project root is hand-authored intent, and never carries
-status. Status lives exclusively in `.crew/state.json`.
+status. Status lives exclusively in `.crew/state.json`. `crew init` leaves a
+stub; the first mate writes into it after you confirm an interview.
 
 ```markdown
 ## task: allow-refuses-when-empty
@@ -241,6 +247,7 @@ handed exactly the remaining headroom can still blow through the ceiling.
 
 | Command | |
 |---|---|
+| `crew init [--lang L] [--force]` | scaffold this project, then check it can run |
 | `crew spawn <id> [--force]` | queue a task's next attempt |
 | `crew review <id>` | read-only: criteria results, diff, approve line |
 | `crew approve <id> --head <sha>` | **requires a terminal** |
@@ -324,6 +331,7 @@ cmd/crew-run/      implementer dispatcher  (test lint build diff commit)
 cmd/crew-check/    verifier dispatcher     (test lint build)
 cmd/fakeclaude/    a scripted stand-in for the claude CLI: drives the whole
                    loop offline, with no API spend
+internal/scaffold/ crew init's language detection and file templates
 internal/watch/    the state machine: spawn, plan, negative control
 internal/dispatch/ the shared dispatcher implementation
 internal/hook/     the PreToolUse gate

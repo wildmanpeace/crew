@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -39,6 +40,10 @@ func main() {
 		os.Exit(cmdHookGate(args))
 	case "worker":
 		os.Exit(cmdWorker(args))
+	// init runs before newApp because there is no config to load yet: writing
+	// one is the point.
+	case "init":
+		os.Exit(cmdInit(args))
 	case "-h", "--help", "help":
 		usage()
 		os.Exit(0)
@@ -295,6 +300,44 @@ func runWatchLoop(app *cli.App) error {
 	return err
 }
 
+// cmdInit scaffolds a project. It resolves the repository root rather than
+// using the working directory, so running it from a subdirectory sets up the
+// project rather than a folder inside it.
+func cmdInit(args []string) int {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	lang := fs.String("lang", "", "go, typescript, csharp, or dart; detected when omitted")
+	force := fs.Bool("force", false, "overwrite files that already exist")
+	if _, err := cli.ParseArgs(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "crew init: %v\n", err)
+		return 2
+	}
+
+	root, err := projectRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "crew init: %v\n", err)
+		return 1
+	}
+	if err := cli.Init(root, os.Stdout, cli.InitOptions{Lang: *lang, Force: *force}); err != nil {
+		fmt.Fprintf(os.Stderr, "crew init: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// projectRoot is the git repository root, falling back to the working
+// directory so init can still report why a non-repository will not work.
+func projectRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	top, err := gitx.New(dir).Run("rev-parse", "--show-toplevel")
+	if err != nil {
+		return dir, nil
+	}
+	return filepath.EvalSymlinks(strings.TrimSpace(top))
+}
+
 // cmdHookGate evaluates one PreToolUse payload. It always exits 0: a denial is
 // expressed in the JSON body, so a gate decision is never mistaken for a
 // crashed hook.
@@ -346,6 +389,9 @@ func cmdWorker(args []string) int {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `crew - agentic orchestration for one project
+
+Setup:
+  crew init [--lang L] [--force]        scaffold this project, then check it
 
 Captain:
   crew spawn <task-id> [--force]        queue a task's next attempt

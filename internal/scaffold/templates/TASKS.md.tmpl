@@ -1,0 +1,25 @@
+# Tasks
+
+Hand-authored intent only. Status never lives here — it lives in
+`.crew/state.json`, and `crew status` is how you read it.
+
+The first mate writes tasks into this file after you confirm an interview.
+You can write them yourself; the shape is:
+
+```markdown
+## task: <kebab-case-id>
+- depends_on: none
+- paths: {{.PathsExample}}
+- brief: >
+    What to build, and any constraint that matters.
+    Say explicitly what not to touch.
+- acceptance_criteria:
+    - check: "{{.CheckExample}}"
+      description: A plain statement of the behaviour.
+    - judged: true
+      description: Something that genuinely needs a reading.
+```
+
+`paths` is a mutual-exclusion declaration: two tasks with overlapping paths
+cannot be in flight at once. Each criterion is either a check command or
+`judged: true` — never both, never neither.

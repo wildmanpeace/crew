@@ -119,38 +119,66 @@ func Load(projectRoot string) (*Config, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	c.applyDefaults()
+	set, err := configuredKeys(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	c.applyDefaults(set)
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
 	return &c, nil
 }
 
-func (c *Config) applyDefaults() {
-	setInt := func(p *int, v int) {
-		if *p == 0 {
+// configuredKeys names the top-level keys the file actually sets.
+//
+// A number's zero value is indistinguishable from an omitted key once it is
+// decoded, and for these settings the difference matters: the loop reads
+// `wall_clock_timeout_seconds <= 0` as "no wall clock", so defaulting a
+// configured 0 made that documented setting unreachable. Reading presence off
+// the raw JSON keeps the field types plain ints and floats for every consumer.
+func configuredKeys(raw []byte) (map[string]bool, error) {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		return nil, err
+	}
+	set := make(map[string]bool, len(keys))
+	for k := range keys {
+		set[k] = true
+	}
+	return set, nil
+}
+
+// applyDefaults fills the settings the file left out. A nil set means nothing
+// was configured, which is what a Config built in code wants.
+func (c *Config) applyDefaults(set map[string]bool) {
+	setInt := func(key string, p *int, v int) {
+		if !set[key] {
 			*p = v
 		}
 	}
-	setFloat := func(p *float64, v float64) {
-		if *p == 0 {
+	setFloat := func(key string, p *float64, v float64) {
+		if !set[key] {
 			*p = v
 		}
 	}
+	// Strings stay on an emptiness check. An explicitly empty branch name,
+	// suffix, or model is not a setting anyone means, so there is nothing to
+	// distinguish from an omitted key.
 	setStr := func(p *string, v string) {
 		if *p == "" {
 			*p = v
 		}
 	}
-	setInt(&c.ConcurrencyCap, 3)
-	setInt(&c.PollIntervalSeconds, 15)
-	setInt(&c.WallClockTimeoutSeconds, 1800)
-	setInt(&c.MaxCycles, 3)
-	setFloat(&c.PerTaskCostCapUSD, 5.00)
-	setFloat(&c.ProjectCostCapUSDPerDay, 25.00)
-	setFloat(&c.PerWorkerBudgetUSD, 1.50)
-	setFloat(&c.BudgetSafetyMargin, 0.25)
-	setFloat(&c.MinSpawnBudgetUSD, 0.10)
+	setInt("concurrency_cap", &c.ConcurrencyCap, 3)
+	setInt("poll_interval_seconds", &c.PollIntervalSeconds, 15)
+	setInt("wall_clock_timeout_seconds", &c.WallClockTimeoutSeconds, 1800)
+	setInt("max_cycles", &c.MaxCycles, 3)
+	setFloat("per_task_cost_cap_usd", &c.PerTaskCostCapUSD, 5.00)
+	setFloat("project_cost_cap_usd_per_day", &c.ProjectCostCapUSDPerDay, 25.00)
+	setFloat("per_worker_budget_usd", &c.PerWorkerBudgetUSD, 1.50)
+	setFloat("budget_safety_margin", &c.BudgetSafetyMargin, 0.25)
+	setFloat("min_spawn_budget_usd", &c.MinSpawnBudgetUSD, 0.10)
 	setStr(&c.BudgetTimezone, "America/Denver")
 	setStr(&c.MainBranch, "main")
 	setStr(&c.VerifyTestSuffix, "_crewverify_test.go")

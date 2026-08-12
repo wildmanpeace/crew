@@ -346,3 +346,75 @@ func TestResolveDoesNotAllowListConfiguredDefaults(t *testing.T) {
 		t.Errorf("Resolve = %q, want %q", got, want)
 	}
 }
+
+// A configured zero is a decision, not an omission. wall_clock_timeout_seconds
+// is the case that matters: the loop reads `timeout <= 0` as "no wall clock",
+// and defaulting a configured 0 to 1800 made that documented setting
+// unreachable from the config file.
+func TestLoadKeepsAConfiguredZero(t *testing.T) {
+	c, err := Load(writeCfg(t, `{
+	  "wall_clock_timeout_seconds": 0,
+	  "poll_interval_seconds": 0,
+	  "budget_safety_margin": 0,
+	  "per_task_cost_cap_usd": 0,
+	  "check_commands": {"test": {"argv": ["go","test"]}}
+	}`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.WallClockTimeoutSeconds != 0 {
+		t.Errorf("WallClockTimeoutSeconds = %d, want the configured 0", c.WallClockTimeoutSeconds)
+	}
+	if c.PollIntervalSeconds != 0 {
+		t.Errorf("PollIntervalSeconds = %d, want the configured 0", c.PollIntervalSeconds)
+	}
+	if c.BudgetSafetyMargin != 0 {
+		t.Errorf("BudgetSafetyMargin = %v, want the configured 0", c.BudgetSafetyMargin)
+	}
+	if c.PerTaskCostCapUSD != 0 {
+		t.Errorf("PerTaskCostCapUSD = %v, want the configured 0", c.PerTaskCostCapUSD)
+	}
+}
+
+// An omitted key still defaults; distinguishing zero from unset must not turn
+// the defaults off.
+func TestLoadStillDefaultsOmittedKeys(t *testing.T) {
+	c, err := Load(writeCfg(t, minimalCfg))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.WallClockTimeoutSeconds != 1800 {
+		t.Errorf("WallClockTimeoutSeconds = %d, want the default 1800", c.WallClockTimeoutSeconds)
+	}
+	if c.PollIntervalSeconds != 15 {
+		t.Errorf("PollIntervalSeconds = %d, want the default 15", c.PollIntervalSeconds)
+	}
+	if c.BudgetSafetyMargin != 0.25 {
+		t.Errorf("BudgetSafetyMargin = %v, want the default 0.25", c.BudgetSafetyMargin)
+	}
+}
+
+// A configured zero that Validate already refuses must now reach Validate
+// rather than being quietly rewritten into a legal value.
+func TestLoadRejectsAConfiguredZeroThatValidateRefuses(t *testing.T) {
+	_, err := Load(writeCfg(t, `{
+	  "max_cycles": 0,
+	  "check_commands": {"test": {"argv": ["go","test"]}}
+	}`))
+	if err == nil {
+		t.Fatal("Load succeeded with max_cycles: 0, want the validation error")
+	}
+	if !strings.Contains(err.Error(), "max_cycles") {
+		t.Errorf("error %q does not name max_cycles", err)
+	}
+}
+
+// applyDefaults runs on a Config built in code too, where there is no JSON to
+// read presence from; every key is unset, so every default applies.
+func TestApplyDefaultsOnAConfigBuiltInCode(t *testing.T) {
+	var c Config
+	c.applyDefaults(nil)
+	if c.WallClockTimeoutSeconds != 1800 || c.MainBranch != "main" {
+		t.Errorf("defaults not applied to a code-built Config: %+v", c)
+	}
+}

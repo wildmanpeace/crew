@@ -317,13 +317,15 @@ with the day's spend against the cap. Those two numbers explain most cases of
 
 ## Configuration
 
-All of `.crew/config.json`. Defaults apply to anything omitted.
+All of `.crew/config.json`. Defaults apply to anything **omitted** — a key set
+to `0` is a setting, not an omission, so `"wall_clock_timeout_seconds": 0`
+turns the wall clock off rather than restoring the default.
 
 | Key | Default | |
 |---|---|---|
 | `concurrency_cap` | `3` | tasks in flight at once |
 | `poll_interval_seconds` | `15` | how often the loop wakes |
-| `wall_clock_timeout_seconds` | `1800` | after which a worker is killed and the task fails |
+| `wall_clock_timeout_seconds` | `1800` | after which a worker is killed and the task fails; `0` disables it |
 | `max_cycles` | `3` | implement/verify cycles before `needs_reframe` |
 | `per_task_cost_cap_usd` | `5.00` | cumulative, across all of a task's workers |
 | `project_cost_cap_usd_per_day` | `25.00` | rolls over in `budget_timezone` |

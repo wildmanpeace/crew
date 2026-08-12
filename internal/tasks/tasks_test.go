@@ -160,6 +160,41 @@ func TestParseRejectsUnknownDependency(t *testing.T) {
 	}
 }
 
+// A worked example inside a fenced code block is documentation, not a task
+// declaration, even though its heading line starts with "## task:".
+func TestParseSkipsTaskHeadingInsideFencedCodeBlock(t *testing.T) {
+	src := "# Tasks\n\nThe shape is:\n\n```markdown\n" +
+		"## task: <kebab-case-id>\n- brief: whatever you like\n" +
+		"- acceptance_criteria:\n    - judged: true\n      description: nonsense yaml: [\n" +
+		"```\n\n" +
+		"## task: alpha\n- brief: do alpha\n- acceptance_criteria:\n    - judged: true\n      description: ok\n"
+	got, err := Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d tasks, want 1 (the fenced example must not count)", len(got))
+	}
+	if got[0].ID != "alpha" {
+		t.Errorf("ID = %q, want %q", got[0].ID, "alpha")
+	}
+}
+
+// CommonMark also allows "~~~" fences and runs longer than three characters;
+// both must be recognised, not just a bare "```".
+func TestParseSkipsTaskHeadingInsideTildeAndLongFences(t *testing.T) {
+	src := "~~~~\n## task: tilde-example\n- brief: x\n~~~~\n\n" +
+		"````\n## task: backtick-example\n- brief: x\n````\n\n" +
+		"## task: real\n- brief: do real\n- acceptance_criteria:\n    - judged: true\n      description: ok\n"
+	got, err := Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "real" {
+		t.Fatalf("got %v, want exactly one task %q", got, "real")
+	}
+}
+
 func TestParseEmptyDocument(t *testing.T) {
 	got, err := Parse(strings.NewReader("# Nothing here\n"))
 	if err != nil {
@@ -175,16 +210,37 @@ func TestPathsOverlap(t *testing.T) {
 		a, b []string
 		want bool
 	}{
+		// Pre-existing, must not regress.
 		{[]string{"middleware/**"}, []string{"middleware/**"}, true},
 		{[]string{"middleware/**"}, []string{"middleware/rate.go"}, true},
 		{[]string{"middleware/**"}, []string{"router.go"}, false},
 		{[]string{"router.go"}, []string{"router.go"}, true},
 		{[]string{"a/**"}, []string{"b/**"}, false},
 		{nil, []string{"a/**"}, false},
+
+		// #7: the two broadest patterns a person would actually write.
+		{[]string{"**"}, []string{"src/billing/total.go"}, true},
+		{[]string{"src/*"}, []string{"src/billing/total.go"}, true},
+		{[]string{"ratelimit/**"}, []string{"ratelimit/bucket.go"}, true},
+
+		// Further coverage of the same conservative-containment logic.
+		{[]string{"**"}, []string{"README.md"}, true},
+		{[]string{"**"}, []string{"**"}, true},
+		{[]string{"src/*"}, []string{"src/billing.go"}, true},
+		{[]string{"src/*"}, []string{"other/billing.go"}, false},
+		{[]string{"src/billing/**"}, []string{"src/auth/**"}, false},
+		{[]string{"src/billing/**"}, []string{"src/billing/sub/total.go"}, true},
+		{[]string{"*.go"}, []string{"main.go"}, true},
+		{[]string{"*.go"}, []string{"main.ts"}, false},
+		{[]string{"*.go"}, []string{"src/main.go"}, false},
 	}
 	for _, tc := range cases {
 		if got := Overlaps(tc.a, tc.b); got != tc.want {
 			t.Errorf("Overlaps(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+		// Overlaps must be symmetric.
+		if got := Overlaps(tc.b, tc.a); got != tc.want {
+			t.Errorf("Overlaps(%q, %q) = %v, want %v", tc.b, tc.a, got, tc.want)
 		}
 	}
 }

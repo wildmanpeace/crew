@@ -81,9 +81,11 @@ type section struct {
 
 func splitSections(r io.Reader) ([]section, error) {
 	var (
-		out  []section
-		cur  *section
-		body strings.Builder
+		out       []section
+		cur       *section
+		body      strings.Builder
+		fenceChar byte
+		fenceLen  int
 	)
 	flush := func() {
 		if cur != nil {
@@ -96,6 +98,29 @@ func splitSections(r io.Reader) ([]section, error) {
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		line := sc.Text()
+
+		if fenceChar != 0 {
+			// Inside a fenced code block: nothing is a heading, including a
+			// worked example's "## task:" line, until the fence closes.
+			if ch, n, ok := fenceMarker(line); ok && ch == fenceChar && n >= fenceLen {
+				fenceChar, fenceLen = 0, 0
+			}
+			if cur != nil {
+				body.WriteString(line)
+				body.WriteByte('\n')
+			}
+			continue
+		}
+
+		if ch, n, ok := fenceMarker(line); ok {
+			fenceChar, fenceLen = ch, n
+			if cur != nil {
+				body.WriteString(line)
+				body.WriteByte('\n')
+			}
+			continue
+		}
+
 		if strings.HasPrefix(strings.TrimSpace(line), taskHeading) {
 			flush()
 			id := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), taskHeading))
@@ -115,6 +140,36 @@ func splitSections(r io.Reader) ([]section, error) {
 	}
 	flush()
 	return out, nil
+}
+
+// fenceMarker reports whether line opens or closes a fenced code block, per
+// CommonMark: a run of three or more identical backticks or tildes, indented
+// at most three spaces. A closing fence must consist of the run and nothing
+// but trailing whitespace; a backtick fence's opening line cannot itself
+// contain a backtick (that ambiguity is left to the writer, not this
+// heuristic).
+func fenceMarker(line string) (ch byte, n int, ok bool) {
+	trimmed := strings.TrimLeft(line, " ")
+	if len(line)-len(trimmed) > 3 || trimmed == "" {
+		return 0, 0, false
+	}
+	c := trimmed[0]
+	if c != '`' && c != '~' {
+		return 0, 0, false
+	}
+	i := 0
+	for i < len(trimmed) && trimmed[i] == c {
+		i++
+	}
+	if i < 3 {
+		return 0, 0, false
+	}
+	rest := strings.TrimSpace(trimmed[i:])
+	if c == '`' && strings.ContainsRune(rest, '`') {
+		// Backtick fences cannot carry a backtick in their info string.
+		return 0, 0, false
+	}
+	return c, i, true
 }
 
 // rawCriterion mirrors the YAML shape so a missing key is distinguishable
@@ -276,18 +331,76 @@ func patternsOverlap(a, b string) bool {
 	if a == b {
 		return true
 	}
-	return globCovers(a, b) || globCovers(b, a)
+	return segmentsOverlap(globSegments(a), globSegments(b))
 }
 
-// globCovers reports whether pattern could match target, treating target's own
-// wildcards literally enough for a conservative answer.
-func globCovers(pattern, target string) bool {
-	if ok, err := path.Match(pattern, target); err == nil && ok {
+// globSegments splits a path pattern on "/". A trailing bare "*" is promoted
+// to "**": a task author writing "src/*" means "everything under src", and
+// the conservative contract (refuse on possible overlap) means we should
+// read it that way rather than silently narrowing it to direct children only.
+func globSegments(pattern string) []string {
+	segs := strings.Split(pattern, "/")
+	if n := len(segs); n > 0 && segs[n-1] == "*" {
+		segs[n-1] = "**"
+	}
+	return segs
+}
+
+// segmentsOverlap reports whether two "/"-delimited segment sequences could
+// describe overlapping sets of paths. "**" matches zero or more whole
+// segments, crossing what path.Match alone would treat as directory
+// boundaries; every other segment is compared with segmentsCompatible. Like
+// Overlaps, it is conservative: an alignment it cannot rule out counts as an
+// overlap.
+func segmentsOverlap(a, b []string) bool {
+	memo := make(map[[2]int]bool, len(a)*len(b))
+	var walk func(i, j int) bool
+	walk = func(i, j int) bool {
+		if i == len(a) && j == len(b) {
+			return true
+		}
+		key := [2]int{i, j}
+		if v, ok := memo[key]; ok {
+			return v
+		}
+		result := false
+		switch {
+		case i < len(a) && a[i] == "**":
+			result = walk(i+1, j) || (j < len(b) && walk(i, j+1))
+		case j < len(b) && b[j] == "**":
+			result = walk(i, j+1) || (i < len(a) && walk(i+1, j))
+		case i == len(a) || j == len(b):
+			result = false
+		default:
+			result = segmentsCompatible(a[i], b[j]) && walk(i+1, j+1)
+		}
+		memo[key] = result
+		return result
+	}
+	return walk(0, 0)
+}
+
+// segmentsCompatible reports whether two single, already-split path segments
+// (never "**") could describe the same path component. A bare "*" is
+// universal. When only one side carries glob syntax, path.Match settles it
+// exactly. When both sides carry glob syntax we cannot resolve symbolically,
+// we assume they could collide rather than risk a false "no overlap".
+func segmentsCompatible(x, y string) bool {
+	if x == y || x == "*" || y == "*" {
 		return true
 	}
-	// path.Match does not let "*" cross separators, so handle "dir/**" prefixes.
-	if base, found := strings.CutSuffix(pattern, "/**"); found {
-		return target == base || strings.HasPrefix(target, base+"/")
+	xWild := strings.ContainsAny(x, "*?[")
+	yWild := strings.ContainsAny(y, "*?[")
+	switch {
+	case xWild && !yWild:
+		ok, err := path.Match(x, y)
+		return err == nil && ok
+	case yWild && !xWild:
+		ok, err := path.Match(y, x)
+		return err == nil && ok
+	case xWild && yWild:
+		return true
+	default:
+		return false
 	}
-	return false
 }

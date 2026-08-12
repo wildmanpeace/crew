@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/wildmanpeace/crew/internal/config"
+	"github.com/wildmanpeace/crew/internal/tasks"
 )
 
 func mustProfile(t *testing.T, lang Language) Profile {
@@ -107,6 +108,33 @@ func TestWrittenAgentsMdSpeaksTheProjectsLanguage(t *testing.T) {
 	}
 	if strings.Contains(body, "./pkg/...") || strings.Contains(body, "_test.go") {
 		t.Error("AGENTS.md leaked Go examples into a TypeScript project")
+	}
+}
+
+// The scaffolded TASKS.md carries a worked example inside a fenced code
+// block so a fresh project has something to imitate. That example must never
+// be mistaken for a real task, or a brand-new project fails to parse until
+// the captain hand-edits the stub.
+func TestScaffoldedTasksMdParsesToZeroTasks(t *testing.T) {
+	for _, lang := range Languages() {
+		t.Run(string(lang), func(t *testing.T) {
+			dir := t.TempDir()
+			if _, err := Write(dir, mustProfile(t, lang), false); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			f, err := os.Open(filepath.Join(dir, "TASKS.md"))
+			if err != nil {
+				t.Fatalf("open TASKS.md: %v", err)
+			}
+			defer f.Close()
+			got, err := tasks.Parse(f)
+			if err != nil {
+				t.Fatalf("the scaffolded TASKS.md does not parse: %v", err)
+			}
+			if len(got) != 0 {
+				t.Errorf("got %d tasks from the scaffold's worked example, want 0", len(got))
+			}
+		})
 	}
 }
 

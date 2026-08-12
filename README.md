@@ -141,9 +141,16 @@ When a task reaches `ready_for_review`:
 
 ```bash
 crew review allow-refuses-when-empty   # criteria, diff, and the approve line
-crew approve allow-refuses-when-empty --head <sha>
-crew land allow-refuses-when-empty
 ```
+
+```bash
+crew approve allow-refuses-when-empty --head <sha>
+```
+
+Approving is the last thing anyone types. The loop lands an approved task
+itself — re-checking the approved sha, requiring a clean `main`, merging in a
+scratch worktree — because none of that decides anything the approval didn't
+already settle. Set `"auto_land": false` to keep `crew land` manual.
 
 ## The loop
 
@@ -157,14 +164,16 @@ pending ──spawn──▶ queued ──▶ running ──▶ verifying
                                               ├─ cycles exhausted ──▶ needs_reframe▼
                                               │                              approved
                                               ├─ verifier failed twice ──▶ blocked  │
-                                              │                                land │
+                                              │                          loop lands │
                                               └─ worker died / timed out ─▶ failed  ▼
                                                                                 landed
 ```
 
 `land_conflict` is the fifth resting state: `main` moved after approval, so the
 approval no longer describes what would land. `crew rebase` clears the stale
-approval and forces a fresh verify pass.
+approval and forces a fresh verify pass. An approved task that stays approved
+is usually waiting on uncommitted work on `main`, which the loop will not merge
+over; it retries each poll and records `land_deferred` once.
 
 A failed cycle does not get its own status — the task simply goes back to
 `running` as the next implementer starts. A verifier that crashes or reports
@@ -235,7 +244,7 @@ handed exactly the remaining headroom can still blow through the ceiling.
 | `crew spawn <id> [--force]` | queue a task's next attempt |
 | `crew review <id>` | read-only: criteria results, diff, approve line |
 | `crew approve <id> --head <sha>` | **requires a terminal** |
-| `crew land <id>` | merge an approved task into main |
+| `crew land <id>` | merge an approved task into main; the loop does this for you unless `auto_land` is off |
 | `crew reframe <id>` | abandon this attempt, start the next |
 | `crew rebase <id>` | rebase onto main; invalidates approval |
 | `crew status [--json] [--markdown]` | state, spend, watcher health |
@@ -286,6 +295,7 @@ All of `.crew/config.json`. Defaults apply to anything omitted.
 | `min_spawn_budget_usd` | `0.10` | below this, refuse rather than start |
 | `budget_timezone` | `America/Denver` | |
 | `main_branch` | `main` | |
+| `auto_land` | `true` | whether the loop lands approved tasks itself |
 | `verify_test_suffix` | `_crewverify_test.go` | marks verifier-authored tests |
 | `test_file_suffix` | `_test.go` | how crew tells a new test from an existing one |
 | `implementer_model` / `verifier_model` | `sonnet` | |
